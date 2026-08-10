@@ -761,6 +761,59 @@ def conditional_unrelated(report, enabled):
     assert contract.runtime_reads(negative, fields) == frozenset()
 
 
+@pytest.mark.parametrize(
+    ("mutation", "receiver_read"),
+    [
+        (
+            'receiver["known"] = report.evaluation',
+            'receiver["known"].satisfaction_threshold',
+        ),
+        (
+            'receiver.update({"known": report.evaluation})',
+            'receiver["known"].satisfaction_threshold',
+        ),
+        (
+            'receiver |= {"known": report.evaluation}',
+            'receiver["known"].satisfaction_threshold',
+        ),
+        (
+            "receiver.clear()",
+            'receiver.get("known", report.evaluation).satisfaction_threshold',
+        ),
+        (
+            'receiver.pop("known")',
+            'receiver.get("known", report.evaluation).satisfaction_threshold',
+        ),
+    ],
+    ids=["assignment", "update", "union", "clear", "pop"],
+)
+def test_runtime_scan_strongly_mutates_conditional_receiver_but_not_possible_aliases(
+    contract,
+    tmp_path: Path,
+    mutation: str,
+    receiver_read: str,
+) -> None:
+    (tmp_path / "conditional_receiver.py").write_text(
+        f"""
+def conditional_receiver(config, report, enabled):
+    left = {{"known": config.evaluation}}
+    right = {{"known": report.evaluation}}
+    receiver = left if enabled else right
+    {mutation}
+    impossible_receiver_read = {receiver_read}
+    possible_alias_read = left.get("known", report.evaluation).stage1_enabled
+""",
+        encoding="utf-8",
+    )
+    positive_alias = contract.ConfigField("evaluation", "stage1_enabled")
+    false_positive = contract.ConfigField("evaluation", "satisfaction_threshold")
+
+    assert contract.runtime_reads(
+        tmp_path,
+        frozenset({positive_alias, false_positive}),
+    ) == frozenset({positive_alias})
+
+
 def test_runtime_scan_keeps_provenance_when_mutating_a_may_alias(contract, tmp_path: Path) -> None:
     (tmp_path / "may_alias_mutation.py").write_text(
         """

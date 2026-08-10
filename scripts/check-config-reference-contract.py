@@ -355,6 +355,12 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                         replacement,
                         conservative=len(owner.identity) > 1,
                     )
+            # A joined owner may refer to one of several source objects, so
+            # those source aliases need conservative updates. The receiver
+            # itself, however, names whichever object was selected at runtime
+            # and therefore always observes the mutation strongly.
+            if isinstance(receiver, ast.Name):
+                self._replace_name_value(receiver.id, replacement)
         elif isinstance(receiver, ast.Name):
             self._replace_name_value(receiver.id, replacement)
 
