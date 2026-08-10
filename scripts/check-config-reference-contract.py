@@ -1475,25 +1475,58 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             return (path,), (path,)
         if path.exception_type is not None:
             raised = path.exception_type.rsplit(".", 1)[-1]
-            relations = {
-                name: cls._known_exception_subclass(raised, name)
-                for name in names
-                if not cls._exception_domain_excluded(name, path.exception_exclusions)
-            }
-            if any(relation is True for relation in relations.values()):
-                return (path,), ()
-            possible = frozenset(name for name, relation in relations.items() if relation is None)
-            if not possible:
+            upper_bound = path.exception_upper_bound or "BaseException"
+            exact_caught_domains: list[str] = []
+            exact_feasible_names: set[str] = set()
+            exact_fully_consumed = False
+            for name in names:
+                relation = cls._known_exception_subclass(raised, name)
+                domain = cls._exception_domain_intersection(upper_bound, name)
+                if (
+                    relation is False
+                    or domain is None
+                    or cls._exception_domain_excluded(domain, path.exception_exclusions)
+                ):
+                    continue
+                exact_feasible_names.add(name)
+                if relation is True or cls._known_exception_subclass(upper_bound, name) is True:
+                    exact_fully_consumed = True
+                if any(
+                    cls._known_exception_subclass(domain, existing) is True
+                    for existing in exact_caught_domains
+                ):
+                    continue
+                exact_caught_domains = [
+                    existing
+                    for existing in exact_caught_domains
+                    if cls._known_exception_subclass(existing, domain) is not True
+                ]
+                exact_caught_domains.append(domain)
+            if not exact_caught_domains:
                 return (), (path,)
+            if exact_fully_consumed:
+                return (path,), ()
+            caught = tuple(
+                _AbruptPath(
+                    path.kind,
+                    path.bindings,
+                    path.return_value,
+                    path.exception_type,
+                    path.exception_exclusions,
+                    domain,
+                )
+                for domain in exact_caught_domains
+            )
+            remaining_exclusions = path.exception_exclusions | exact_feasible_names
             remaining = _AbruptPath(
                 path.kind,
                 path.bindings,
                 path.return_value,
                 path.exception_type,
-                path.exception_exclusions | possible,
-                path.exception_upper_bound,
+                remaining_exclusions,
+                upper_bound,
             )
-            return (path,), (remaining,)
+            return caught, (remaining,)
 
         upper_bound = path.exception_upper_bound or "BaseException"
         caught_domains: list[str] = []

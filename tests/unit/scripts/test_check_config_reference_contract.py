@@ -1703,6 +1703,19 @@ def broader_handler_subtracts_unknown_exact_domain(config, error_type):
         handler = outer_reader
     handler(config.consensus)
 
+def unknown_exact_reraise_keeps_handler_domain(config, error_type):
+    handler = external
+    try:
+        try:
+            raise error_type
+        except Exception:
+            raise
+        except:
+            pass
+    except SystemExit:
+        handler = unreachable_reader
+    handler(config.consensus)
+
 def tuple_uses_static_subclass_match(config):
     handler = external
     try:
