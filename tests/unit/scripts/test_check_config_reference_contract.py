@@ -543,6 +543,167 @@ def dict_consumers(config, report, dynamic_key):
     )
 
 
+def test_runtime_scan_propagates_mutable_mapping_identity_across_aliases(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "mutable_mapping_aliases.py").write_text(
+        """
+def dynamic_setdefault(config, key):
+    sections = {}
+    sections.setdefault(key, config.evaluation)
+    for section in sections.values():
+        dynamic_read = section.stage1_enabled
+
+def aliased_setdefault(config):
+    sections = {}
+    alias = sections
+    alias.setdefault("x", config.evaluation)
+    alias_read = sections["x"].stage2_enabled
+
+def augmented_union(config):
+    sections = {}
+    alias = sections
+    sections |= {"x": config.evaluation}
+    augmented_read = alias["x"].stage3_enabled
+
+def constructors(config):
+    source = {"x": config.evaluation}
+    expanded = dict(**source)
+    expanded_read = expanded["x"].assertion_extraction_model
+    pairs = dict([("x", config.evaluation)])
+    pairs_read = pairs["x"].uncertainty_threshold
+    keywords = dict(x=config.evaluation)
+    keyword_read = keywords["x"].semantic_model
+
+def direct_mutations(config):
+    sections = {}
+    alias = sections
+    alias["x"] = config.evaluation
+    assigned_read = sections["x"].stage1_enabled
+
+    consensus = {}
+    consensus_alias = consensus
+    consensus_alias.update({"x": config.consensus})
+    updated_read = consensus["x"].models
+
+    pair_updates = {}
+    pair_alias = pair_updates
+    pair_alias.update([("x", config.consensus)])
+    pair_update_read = pair_updates["x"].devil_model
+
+def conditional_alias(config, enabled):
+    left = {}
+    right = {}
+    alias = left if enabled else right
+    alias.setdefault("x", config.consensus)
+    possible_left_read = left.get("x").advocate_model
+
+def dynamic_assignment(config, key):
+    sections = {}
+    alias = sections
+    alias[key] = config.evaluation
+    for section in sections.values():
+        dynamic_assignment_read = section.stage3_enabled
+
+def provenance_kills(config):
+    cleared = {"x": config.evaluation}
+    cleared_alias = cleared
+    cleared_alias.clear()
+    cleared_read = cleared.get("x").satisfaction_threshold
+
+    popped = {"x": config.evaluation}
+    popped.pop("x")
+    popped_read = popped.get("x").satisfaction_threshold
+
+def unrelated_mutations(report, key):
+    sections = {}
+    alias = sections
+    alias.setdefault(key, report.evaluation)
+    alias["x"] = report.evaluation
+    alias |= {"y": report.evaluation}
+    alias.update({"z": report.evaluation})
+    for section in sections.values():
+        unrelated_read = section.satisfaction_threshold
+
+    source = {"x": report.evaluation}
+    expanded = dict(**source)
+    pairs = dict([("x", report.evaluation)])
+    expanded_read = expanded["x"].satisfaction_threshold
+    pairs_read = pairs["x"].satisfaction_threshold
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+        }
+    )
+
+
+def test_runtime_scan_keeps_provenance_when_mutating_a_may_alias(contract, tmp_path: Path) -> None:
+    (tmp_path / "may_alias_mutation.py").write_text(
+        """
+def may_alias_clear(config, report, enabled):
+    left = {"x": config.evaluation}
+    right = {"x": report.evaluation}
+    alias = left if enabled else right
+    alias.clear()
+    possible_uncleared_read = left.get("x").stage1_enabled
+
+def independent_report_maps(report):
+    left = {"x": report.evaluation}
+    right = {"x": report.evaluation}
+    alias = left
+    alias.clear()
+    unrelated_read = right.get("x").satisfaction_threshold
+
+def popped_value(config):
+    values = {"x": config.evaluation}
+    popped = values.pop("x")
+    popped_read = popped.stage2_enabled
+    removed_read = values.get("x").satisfaction_threshold
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+        }
+    )
+
+
 def test_runtime_scan_comprehension_targets_shadow_outer_aliases_in_evaluation_order(
     contract, tmp_path: Path
 ) -> None:

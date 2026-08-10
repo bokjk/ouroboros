@@ -160,6 +160,8 @@ class _AbstractValue:
     items: tuple[_AbstractValue, ...] | None = None
     entries: tuple[tuple[str, _AbstractValue], ...] | None = None
     attributes: tuple[tuple[str, _AbstractValue], ...] | None = None
+    identity: frozenset[int] = frozenset()
+    literal: str | None = None
 
 
 _UNKNOWN_VALUE = _AbstractValue()
@@ -215,6 +217,12 @@ def _join_values(*values: _AbstractValue) -> _AbstractValue:
         items=items,
         entries=join_named(value.entries for value in values),
         attributes=join_named(value.attributes for value in values),
+        identity=frozenset().union(*(value.identity for value in values)),
+        literal=(
+            values[0].literal
+            if all(value.literal == values[0].literal for value in values)
+            else None
+        ),
     )
 
 
@@ -255,20 +263,134 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 return
         self._states[-1][name] = value
 
+    def _replace_identity(
+        self,
+        value: _AbstractValue,
+        identity: frozenset[int],
+        replacement: _AbstractValue,
+        *,
+        conservative: bool,
+    ) -> _AbstractValue:
+        if value.identity & identity:
+            return _join_values(value, replacement) if conservative else replacement
+        items = (
+            tuple(
+                self._replace_identity(item, identity, replacement, conservative=conservative)
+                for item in value.items
+            )
+            if value.items is not None
+            else None
+        )
+        entries = (
+            tuple(
+                (
+                    key,
+                    self._replace_identity(item, identity, replacement, conservative=conservative),
+                )
+                for key, item in value.entries
+            )
+            if value.entries is not None
+            else None
+        )
+        attributes = (
+            tuple(
+                (
+                    name,
+                    self._replace_identity(item, identity, replacement, conservative=conservative),
+                )
+                for name, item in value.attributes
+            )
+            if value.attributes is not None
+            else None
+        )
+        if items == value.items and entries == value.entries and attributes == value.attributes:
+            return value
+        return _AbstractValue(
+            origins=value.origins,
+            items=items,
+            entries=entries,
+            attributes=attributes,
+            identity=value.identity,
+            literal=value.literal,
+        )
+
+    def _replace_shared_value(
+        self,
+        owner: _AbstractValue,
+        replacement: _AbstractValue,
+        receiver: ast.AST,
+    ) -> None:
+        if owner.identity:
+            for scope in self._states:
+                for name, value in tuple(scope.items()):
+                    scope[name] = self._replace_identity(
+                        value,
+                        owner.identity,
+                        replacement,
+                        conservative=len(owner.identity) > 1,
+                    )
+        elif isinstance(receiver, ast.Name):
+            self._replace_name_value(receiver.id, replacement)
+
+    @staticmethod
+    def _mapping_replacement(
+        owner: _AbstractValue,
+        entries: Iterable[tuple[str, _AbstractValue]],
+    ) -> _AbstractValue:
+        return _AbstractValue(
+            origins=owner.origins,
+            items=owner.items,
+            entries=tuple(entries),
+            attributes=owner.attributes,
+            identity=owner.identity,
+            literal=owner.literal,
+        )
+
     @staticmethod
     def _mapping_values(value: _AbstractValue) -> tuple[_AbstractValue, ...]:
         return tuple(item for _, item in value.entries or ())
+
+    @staticmethod
+    def _mapping_source_entries(
+        source: _AbstractValue,
+    ) -> tuple[tuple[str, _AbstractValue], ...]:
+        if source.entries is not None:
+            return source.entries
+        if source.items is not None:
+            entries: list[tuple[str, _AbstractValue]] = []
+            for pair in source.items:
+                if pair.items is not None and len(pair.items) >= 2:
+                    entries.append((pair.items[0].literal or "**", pair.items[1]))
+            return tuple(entries)
+        return (("**", _conservative_value(source)),)
 
     def _dict_method_value(self, node: ast.Call) -> _AbstractValue | None:
         if not isinstance(node.func, ast.Attribute):
             return None
         method = node.func.attr
-        if method not in {"copy", "get", "items", "keys", "setdefault", "values"}:
+        if method not in {
+            "clear",
+            "copy",
+            "get",
+            "items",
+            "keys",
+            "pop",
+            "setdefault",
+            "update",
+            "values",
+        }:
             return None
         owner = self._expression_value(node.func.value)
         values = self._mapping_values(owner)
         if method == "copy":
-            return owner
+            return _AbstractValue(
+                origins=owner.origins,
+                items=owner.items,
+                entries=owner.entries,
+                attributes=owner.attributes,
+                identity=frozenset({id(node)}),
+                literal=owner.literal,
+            )
         if method == "values":
             return _AbstractValue(items=values) if owner.entries is not None else _UNKNOWN_VALUE
         if method == "items":
@@ -284,39 +406,88 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 else _UNKNOWN_VALUE
             )
 
+        if method == "clear":
+            replacement = self._mapping_replacement(owner, ())
+            self._replace_shared_value(owner, replacement, node.func.value)
+            return _UNKNOWN_VALUE
+        if method == "update":
+            entries = dict(owner.entries or ())
+            if node.args:
+                source = self._expression_value(node.args[0])
+                for name, value in self._mapping_source_entries(source):
+                    entries[name] = (
+                        _join_values(entries.get(name, _UNKNOWN_VALUE), value)
+                        if name == "**"
+                        else value
+                    )
+            for keyword in node.keywords:
+                value = self._expression_value(keyword.value)
+                if keyword.arg is None:
+                    if value.entries is not None:
+                        entries.update(value.entries)
+                    else:
+                        entries["**"] = _join_values(
+                            entries.get("**", _UNKNOWN_VALUE),
+                            _conservative_value(value),
+                        )
+                else:
+                    entries[_key_token(ast.Constant(keyword.arg))] = value
+            replacement = self._mapping_replacement(owner, sorted(entries.items()))
+            self._replace_shared_value(owner, replacement, node.func.value)
+            return _UNKNOWN_VALUE
+
         default = self._expression_value(node.args[1]) if len(node.args) >= 2 else _UNKNOWN_VALUE
         if not node.args:
             return default
         key = node.args[0]
         if not isinstance(key, ast.Constant):
+            if method == "setdefault":
+                return self._dynamic_setdefault_value(node)
             return _join_values(*values, default)
         token = _key_token(key)
         selected = self._named_value(owner.entries, token)
         if method == "get":
             return selected if selected is not None else default
 
+        if method == "pop":
+            if selected is not None and owner.entries is not None:
+                replacement = self._mapping_replacement(
+                    owner, ((name, value) for name, value in owner.entries if name != token)
+                )
+                self._replace_shared_value(owner, replacement, node.func.value)
+                return selected
+            return default
+
         # ``setdefault`` returns the existing value or inserts and returns the
-        # default. Mutate a direct name receiver so a later read sees the
-        # inserted abstract value; aliases remain deliberately bounded.
+        # default. A dynamic key may hit any existing entry or create a new
+        # one, so join the default into every possible target and ``**``.
         if selected is not None:
             return selected
-        if owner.entries is not None and isinstance(node.func.value, ast.Name):
-            entries = (*owner.entries, (token, default))
-            self._replace_name_value(
-                node.func.value.id,
-                _AbstractValue(
-                    origins=owner.origins,
-                    items=owner.items,
-                    entries=entries,
-                    attributes=owner.attributes,
-                ),
-            )
+        if owner.entries is not None:
+            entries = dict(owner.entries)
+            entries[token] = default
+            replacement = self._mapping_replacement(owner, sorted(entries.items()))
+            self._replace_shared_value(owner, replacement, node.func.value)
         return default
+
+    def _dynamic_setdefault_value(self, node: ast.Call) -> _AbstractValue:
+        assert isinstance(node.func, ast.Attribute)
+        owner = self._expression_value(node.func.value)
+        values = self._mapping_values(owner)
+        default = self._expression_value(node.args[1]) if len(node.args) >= 2 else _UNKNOWN_VALUE
+        if owner.entries is not None:
+            entries = {name: _join_values(value, default) for name, value in owner.entries}
+            entries["**"] = _join_values(entries.get("**", _UNKNOWN_VALUE), default)
+            replacement = self._mapping_replacement(owner, sorted(entries.items()))
+            self._replace_shared_value(owner, replacement, node.func.value)
+        return _join_values(*values, default)
 
     def _expression_value(self, node: ast.AST) -> _AbstractValue:
         cached = self._expression_cache.get(id(node))
         if cached is not None:
             return cached
+        if isinstance(node, ast.Constant):
+            return _AbstractValue(literal=_key_token(node))
         if isinstance(node, ast.Name):
             return self._name_value(node.id)
         if isinstance(node, ast.Attribute):
@@ -336,6 +507,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             dict_method_value = self._dict_method_value(node)
             if dict_method_value is not None:
+                self._expression_cache[id(node)] = dict_method_value
                 return dict_method_value
             callable_name = _callable_name(node.func)
             if callable_name is not None and _CONFIG_FACTORY.search(callable_name):
@@ -382,13 +554,17 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "dict":
                 entries: list[tuple[str, _AbstractValue]] = []
                 if node.args:
-                    entries.extend(self._expression_value(node.args[0]).entries or ())
-                entries.extend(
-                    (_key_token(ast.Constant(keyword.arg)), self._expression_value(keyword.value))
-                    for keyword in node.keywords
-                    if keyword.arg is not None
-                )
-                return _AbstractValue(entries=tuple(entries))
+                    source = self._expression_value(node.args[0])
+                    entries.extend(self._mapping_source_entries(source))
+                for keyword in node.keywords:
+                    value = self._expression_value(keyword.value)
+                    if keyword.arg is not None:
+                        entries.append((_key_token(ast.Constant(keyword.arg)), value))
+                    elif value.entries is not None:
+                        entries.extend(value.entries)
+                    else:
+                        entries.append(("**", _conservative_value(value)))
+                return _AbstractValue(entries=tuple(entries), identity=frozenset({id(node)}))
             return _UNKNOWN_VALUE
         if isinstance(node, ast.Subscript):
             owner = self._expression_value(node.value)
@@ -426,7 +602,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                     entries.extend(value.entries)
                 else:
                     entries.append(("**", _conservative_value(value)))
-            return _AbstractValue(entries=tuple(entries))
+            return _AbstractValue(entries=tuple(entries), identity=frozenset({id(node)}))
         if isinstance(node, ast.IfExp):
             return _join_values(
                 self._expression_value(node.body), self._expression_value(node.orelse)
@@ -438,7 +614,10 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             right = self._expression_value(node.right)
             entries = dict(left.entries or ())
             entries.update(right.entries or ())
-            return _AbstractValue(entries=tuple(sorted(entries.items())))
+            return _AbstractValue(
+                entries=tuple(sorted(entries.items())),
+                identity=frozenset({id(node)}),
+            )
         if isinstance(node, ast.NamedExpr):
             return self._expression_value(node.value)
         return _UNKNOWN_VALUE
@@ -545,11 +724,27 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         elif isinstance(target, ast.Starred):
             self._visit_store_target(target.value)
 
+    def _assign_store_target(self, target: ast.expr, value: _AbstractValue) -> None:
+        if not isinstance(target, ast.Subscript):
+            return
+        owner = self._expression_value(target.value)
+        if owner.entries is None and not owner.identity:
+            return
+        entries = dict(owner.entries or ())
+        if isinstance(target.slice, ast.Constant):
+            entries[_key_token(target.slice)] = value
+        else:
+            entries = {name: _join_values(existing, value) for name, existing in entries.items()}
+            entries["**"] = _join_values(entries.get("**", _UNKNOWN_VALUE), value)
+        replacement = self._mapping_replacement(owner, sorted(entries.items()))
+        self._replace_shared_value(owner, replacement, target.value)
+
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         value = self._expression_value(node.value)
         for target in node.targets:
             self._visit_store_target(target)
+            self._assign_store_target(target, value)
             self._bind_destructured(target, value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -557,15 +752,31 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         if node.value is not None:
             self.visit(node.value)
             self._visit_store_target(node.target)
-            self._bind_destructured(node.target, self._expression_value(node.value))
+            value = self._expression_value(node.value)
+            self._assign_store_target(node.target, value)
+            self._bind_destructured(node.target, value)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
         self._bind_destructured(node.target, self._expression_value(node.value))
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        owner = self._expression_value(node.target)
         self.visit(node.target)
         self.visit(node.value)
+        if isinstance(node.op, ast.BitOr):
+            right = self._expression_value(node.value)
+            entries = dict(owner.entries or ())
+            if right.entries is not None:
+                entries.update(right.entries)
+            else:
+                entries["**"] = _join_values(
+                    entries.get("**", _UNKNOWN_VALUE),
+                    _conservative_value(right),
+                )
+            replacement = self._mapping_replacement(owner, sorted(entries.items()))
+            self._replace_shared_value(owner, replacement, node.target)
+            return
         if isinstance(node.target, ast.Name):
             self._states[-1][node.target.id] = self._name_value(node.target.id)
 
@@ -739,7 +950,9 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                     for key, value in subject.entries or ()
                     if key not in matched_tokens
                 )
-                self._states[-1][pattern.rest] = _AbstractValue(entries=remaining)
+                self._states[-1][pattern.rest] = _AbstractValue(
+                    entries=remaining, identity=frozenset({id(pattern)})
+                )
             return
         if isinstance(pattern, ast.MatchClass):
             fallback = _conservative_value(subject)
@@ -830,7 +1043,8 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 self.visit(node.key)
                 self.visit(node.value)
                 result = _AbstractValue(
-                    entries=((_key_token(node.key), self._expression_value(node.value)),)
+                    entries=((_key_token(node.key), self._expression_value(node.value)),),
+                    identity=frozenset({id(node)}),
                 )
             else:
                 self.visit(node.elt)
