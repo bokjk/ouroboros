@@ -184,13 +184,24 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             owner_state = self._expression_state(node.value)
             if node.attr in TRACKED_SECTIONS and _CONFIG_ROOT in owner_state:
                 return frozenset({node.attr})
-            if _looks_like_config_name(node.attr):
+            if _looks_like_config_name(node.attr) and (
+                _CONFIG_ROOT in owner_state
+                or isinstance(node.value, ast.Name)
+                and node.value.id in {"self", "cls"}
+            ):
                 return frozenset({_CONFIG_ROOT})
             return _UNKNOWN_STATE
         if isinstance(node, ast.Call):
             callable_name = _callable_name(node.func)
             if callable_name is not None and _CONFIG_FACTORY.search(callable_name):
-                return frozenset({_CONFIG_ROOT})
+                if isinstance(node.func, ast.Name):
+                    return frozenset({_CONFIG_ROOT})
+                if isinstance(node.func, ast.Attribute) and (
+                    _CONFIG_ROOT in self._expression_state(node.func.value)
+                    or isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in {"self", "cls"}
+                ):
+                    return frozenset({_CONFIG_ROOT})
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id == "getattr"
@@ -241,11 +252,93 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 self._record(section, node.args[1].value)
         self.generic_visit(node)
 
+    @staticmethod
+    def _join_states(
+        *states: Mapping[str, frozenset[str]],
+    ) -> dict[str, frozenset[str]]:
+        names = set().union(*(state.keys() for state in states))
+        return {
+            name: frozenset().union(*(state.get(name, _UNKNOWN_STATE) for state in states))
+            for name in names
+        }
+
+    def _bind_target_state(self, target: ast.expr, state: frozenset[str]) -> None:
+        if isinstance(target, ast.Name):
+            self._states[-1][target.id] = state
+        elif isinstance(target, ast.Starred):
+            self._bind_target_state(target.value, state)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self._bind_target_state(element, state)
+
+    def _sequence_item_state(self, value: ast.AST) -> frozenset[str]:
+        if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            return frozenset().union(
+                *(
+                    self._sequence_item_state(element.value)
+                    if isinstance(element, ast.Starred)
+                    else self._expression_state(element)
+                    for element in value.elts
+                )
+            )
+        if isinstance(value, ast.Dict):
+            return frozenset().union(
+                *(self._expression_state(key) for key in value.keys if key is not None)
+            )
+        return _UNKNOWN_STATE
+
+    def _bind_destructured(self, target: ast.expr, value: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            self._states[-1][target.id] = self._expression_state(value)
+            return
+        if isinstance(target, ast.Starred):
+            self._bind_target_state(target.value, self._sequence_item_state(value))
+            return
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return
+
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            self._bind_target_state(target, self._sequence_item_state(value))
+            return
+
+        starred = next(
+            (
+                index
+                for index, element in enumerate(target.elts)
+                if isinstance(element, ast.Starred)
+            ),
+            None,
+        )
+        if starred is None:
+            if len(target.elts) == len(value.elts):
+                for child_target, child_value in zip(target.elts, value.elts, strict=True):
+                    self._bind_destructured(child_target, child_value)
+            else:
+                self._bind_target_state(target, self._sequence_item_state(value))
+            return
+
+        suffix_length = len(target.elts) - starred - 1
+        if len(value.elts) < starred + suffix_length:
+            self._bind_target_state(target, self._sequence_item_state(value))
+            return
+        for child_target, child_value in zip(
+            target.elts[:starred], value.elts[:starred], strict=True
+        ):
+            self._bind_destructured(child_target, child_value)
+        starred_values = value.elts[starred : len(value.elts) - suffix_length or None]
+        self._bind_target_state(
+            target.elts[starred],
+            frozenset().union(*(self._expression_state(item) for item in starred_values)),
+        )
+        if suffix_length:
+            for child_target, child_value in zip(
+                target.elts[-suffix_length:], value.elts[-suffix_length:], strict=True
+            ):
+                self._bind_destructured(child_target, child_value)
+
     def _bind_aliases(self, targets: Iterable[ast.expr], value: ast.AST) -> None:
-        state = self._expression_state(value)
         for target in targets:
-            if isinstance(target, ast.Name):
-                self._states[-1][target.id] = state
+            self._bind_destructured(target, value)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
@@ -270,6 +363,20 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self.visit(statement)
         return dict(self._states[-1])
 
+    def _visit_paths(
+        self,
+        statements: Iterable[ast.stmt],
+        initial: dict[str, frozenset[str]],
+    ) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+        """Visit statements and retain every state where an exception may branch."""
+
+        self._states[-1] = dict(initial)
+        prefixes = dict(initial)
+        for statement in statements:
+            self.visit(statement)
+            prefixes = self._join_states(prefixes, self._states[-1])
+        return dict(self._states[-1]), prefixes
+
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
         initial = dict(self._states[-1])
@@ -279,6 +386,165 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             name: body_state.get(name, _UNKNOWN_STATE) | else_state.get(name, _UNKNOWN_STATE)
             for name in body_state.keys() | else_state.keys()
         }
+
+    def _bind_iteration_target(self, target: ast.expr, iterable: ast.AST) -> None:
+        if isinstance(iterable, (ast.Tuple, ast.List, ast.Set)):
+            candidate_states: list[dict[str, frozenset[str]]] = []
+            initial = dict(self._states[-1])
+            for element in iterable.elts:
+                self._states[-1] = dict(initial)
+                if isinstance(element, ast.Starred):
+                    self._bind_target_state(target, self._sequence_item_state(element.value))
+                else:
+                    self._bind_destructured(target, element)
+                candidate_states.append(dict(self._states[-1]))
+            self._states[-1] = self._join_states(*candidate_states) if candidate_states else initial
+            return
+        self._bind_target_state(target, self._sequence_item_state(iterable))
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        entry = dict(self._states[-1])
+        header = entry
+        while True:
+            self._states[-1] = dict(header)
+            self._bind_iteration_target(node.target, node.iter)
+            body_state = self._visit_branch(node.body, dict(self._states[-1]))
+            joined = self._join_states(entry, body_state)
+            if joined == header:
+                break
+            header = joined
+        # The else suite can run after zero or more iterations; a break can
+        # bypass it, so retain both paths.
+        else_state = self._visit_branch(node.orelse, header) if node.orelse else header
+        self._states[-1] = self._join_states(header, body_state, else_state)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
+
+    def visit_While(self, node: ast.While) -> None:
+        entry = dict(self._states[-1])
+        header = entry
+        while True:
+            self._states[-1] = dict(header)
+            self.visit(node.test)
+            tested_state = dict(self._states[-1])
+            body_state = self._visit_branch(node.body, tested_state)
+            joined = self._join_states(entry, body_state)
+            if joined == header:
+                break
+            header = joined
+        # ``tested_state`` is the false-test exit; ``body_state`` also covers
+        # a possible break that does not execute the else suite.
+        else_state = self._visit_branch(node.orelse, tested_state) if node.orelse else tested_state
+        self._states[-1] = self._join_states(tested_state, body_state, else_state)
+
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
+        entry = dict(self._states[-1])
+        body_state, exception_states = self._visit_paths(node.body, entry)
+        normal_state = self._visit_branch(node.orelse, body_state) if node.orelse else body_state
+        completed = [normal_state]
+        for handler in node.handlers:
+            self._states[-1] = dict(exception_states)
+            if handler.type is not None:
+                self.visit(handler.type)
+            if handler.name is not None:
+                self._states[-1][handler.name] = _UNKNOWN_STATE
+            completed.append(self._visit_branch(handler.body, dict(self._states[-1])))
+
+        if node.finalbody:
+            # ``finally`` observes normal, handled, and still-propagating
+            # exception paths. Applying it to their may-join preserves every
+            # possible config origin without inventing a report origin.
+            incoming = self._join_states(exception_states, *completed)
+            self._states[-1] = self._visit_branch(node.finalbody, incoming)
+        else:
+            self._states[-1] = self._join_states(*completed)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> None:
+        self._visit_try(node)
+
+    def _bind_pattern(self, pattern: ast.pattern, subject: ast.AST) -> None:
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.pattern is not None:
+                self._bind_pattern(pattern.pattern, subject)
+            if pattern.name is not None:
+                self._states[-1][pattern.name] = self._expression_state(subject)
+            return
+        if isinstance(pattern, ast.MatchStar):
+            if pattern.name is not None:
+                self._states[-1][pattern.name] = self._sequence_item_state(subject)
+            return
+        if isinstance(pattern, ast.MatchOr):
+            initial = dict(self._states[-1])
+            alternatives: list[dict[str, frozenset[str]]] = []
+            for alternative in pattern.patterns:
+                self._states[-1] = dict(initial)
+                self._bind_pattern(alternative, subject)
+                alternatives.append(dict(self._states[-1]))
+            self._states[-1] = self._join_states(*alternatives)
+            return
+        if isinstance(pattern, ast.MatchSequence):
+            if isinstance(subject, (ast.Tuple, ast.List)) and len(pattern.patterns) == len(
+                subject.elts
+            ):
+                for child_pattern, child_subject in zip(
+                    pattern.patterns, subject.elts, strict=True
+                ):
+                    self._bind_pattern(child_pattern, child_subject)
+            else:
+                state = self._sequence_item_state(subject)
+                for child_pattern in pattern.patterns:
+                    self._bind_pattern_state(child_pattern, state)
+            return
+        if isinstance(pattern, ast.MatchMapping):
+            for child_pattern in pattern.patterns:
+                self._bind_pattern_state(child_pattern, _UNKNOWN_STATE)
+            if pattern.rest is not None:
+                self._states[-1][pattern.rest] = _UNKNOWN_STATE
+            return
+        if isinstance(pattern, ast.MatchClass):
+            for child_pattern in (*pattern.patterns, *pattern.kwd_patterns):
+                self._bind_pattern_state(child_pattern, _UNKNOWN_STATE)
+
+    def _bind_pattern_state(self, pattern: ast.pattern, state: frozenset[str]) -> None:
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.pattern is not None:
+                self._bind_pattern_state(pattern.pattern, state)
+            if pattern.name is not None:
+                self._states[-1][pattern.name] = state
+        elif isinstance(pattern, ast.MatchStar):
+            if pattern.name is not None:
+                self._states[-1][pattern.name] = state
+        elif isinstance(pattern, ast.MatchOr):
+            for alternative in pattern.patterns:
+                self._bind_pattern_state(alternative, state)
+        elif isinstance(pattern, ast.MatchSequence):
+            for child_pattern in pattern.patterns:
+                self._bind_pattern_state(child_pattern, state)
+        elif isinstance(pattern, ast.MatchMapping):
+            for child_pattern in pattern.patterns:
+                self._bind_pattern_state(child_pattern, state)
+            if pattern.rest is not None:
+                self._states[-1][pattern.rest] = state
+        elif isinstance(pattern, ast.MatchClass):
+            for child_pattern in (*pattern.patterns, *pattern.kwd_patterns):
+                self._bind_pattern_state(child_pattern, state)
+
+    def visit_Match(self, node: ast.Match) -> None:
+        self.visit(node.subject)
+        initial = dict(self._states[-1])
+        branches = [initial]
+        for case in node.cases:
+            self._states[-1] = dict(initial)
+            self._bind_pattern(case.pattern, node.subject)
+            if case.guard is not None:
+                self.visit(case.guard)
+            branches.append(self._visit_branch(case.body, dict(self._states[-1])))
+        self._states[-1] = self._join_states(*branches)
 
     @staticmethod
     def _argument_state(argument: ast.arg) -> frozenset[str]:
