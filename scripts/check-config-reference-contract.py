@@ -212,10 +212,32 @@ def _join_values(*values: _AbstractValue) -> _AbstractValue:
             for name in sorted(names)
         )
 
+    def join_entries(
+        groups: Iterable[tuple[tuple[str, _AbstractValue], ...] | None],
+    ) -> tuple[tuple[str, _AbstractValue], ...] | None:
+        raw = list(groups)
+        if not any(group is not None for group in raw):
+            return None
+        mappings = [dict(group or ()) for group in raw]
+        names = set().union(*(group.keys() for group in mappings))
+        missing = _origin_value(_MAPPING_MISSING)
+        joined: list[tuple[str, _AbstractValue]] = []
+        for name in sorted(names):
+            possibilities: list[_AbstractValue] = []
+            for group in mappings:
+                if name in group:
+                    possibilities.append(group[name])
+                elif name != _DYNAMIC_KEY and _DYNAMIC_KEY in group:
+                    possibilities.append(_join_values(group[_DYNAMIC_KEY], missing))
+                else:
+                    possibilities.append(missing)
+            joined.append((name, _join_values(*possibilities)))
+        return tuple(joined)
+
     return _AbstractValue(
         origins=origins,
         items=items,
-        entries=join_named(value.entries for value in values),
+        entries=join_entries(value.entries for value in values),
         attributes=join_named(value.attributes for value in values),
         identity=frozenset().union(*(value.identity for value in values)),
         literal=(
@@ -228,6 +250,10 @@ def _join_values(*values: _AbstractValue) -> _AbstractValue:
 
 def _key_token(node: ast.AST) -> str:
     return ast.dump(node, annotate_fields=True, include_attributes=False)
+
+
+_DYNAMIC_KEY = "**"
+_MAPPING_MISSING = "<mapping-missing>"
 
 
 class _RuntimeReadVisitor(ast.NodeVisitor):
@@ -351,18 +377,62 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         return tuple(item for _, item in value.entries or ())
 
     @staticmethod
+    def _add_mapping_entry(
+        entries: dict[str, _AbstractValue],
+        key: str,
+        value: _AbstractValue,
+    ) -> None:
+        """Apply one mapping write in evaluation order.
+
+        A dynamic key may collide with every key written before it. A later
+        literal key, however, deterministically overrides any earlier dynamic
+        collision for that literal key.
+        """
+
+        if key == _DYNAMIC_KEY:
+            for known in tuple(entries):
+                if known != _DYNAMIC_KEY:
+                    entries[known] = _join_values(entries[known], value)
+            entries[_DYNAMIC_KEY] = _join_values(entries.get(_DYNAMIC_KEY, _UNKNOWN_VALUE), value)
+            return
+        entries[key] = value
+
+    @classmethod
+    def _overlay_mapping_entries(
+        cls,
+        base: Mapping[str, _AbstractValue],
+        source: Mapping[str, _AbstractValue],
+    ) -> dict[str, _AbstractValue]:
+        """Overlay a normalized source mapping onto a normalized base."""
+
+        result = dict(base)
+        source_known = {key for key in source if key != _DYNAMIC_KEY}
+        wildcard = source.get(_DYNAMIC_KEY)
+        if wildcard is not None:
+            for known in tuple(result):
+                if known != _DYNAMIC_KEY and known not in source_known:
+                    result[known] = _join_values(result[known], wildcard)
+            result[_DYNAMIC_KEY] = _join_values(result.get(_DYNAMIC_KEY, _UNKNOWN_VALUE), wildcard)
+        for key in source_known:
+            result[key] = source[key]
+        return result
+
+    @classmethod
     def _mapping_source_entries(
+        cls,
         source: _AbstractValue,
     ) -> tuple[tuple[str, _AbstractValue], ...]:
         if source.entries is not None:
             return source.entries
         if source.items is not None:
-            entries: list[tuple[str, _AbstractValue]] = []
+            entries: dict[str, _AbstractValue] = {}
             for pair in source.items:
                 if pair.items is not None and len(pair.items) >= 2:
-                    entries.append((pair.items[0].literal or "**", pair.items[1]))
-            return tuple(entries)
-        return (("**", _conservative_value(source)),)
+                    cls._add_mapping_entry(
+                        entries, pair.items[0].literal or _DYNAMIC_KEY, pair.items[1]
+                    )
+            return tuple(sorted(entries.items()))
+        return ((_DYNAMIC_KEY, _conservative_value(source)),)
 
     def _dict_method_value(self, node: ast.Call) -> _AbstractValue | None:
         if not isinstance(node.func, ast.Attribute):
@@ -414,21 +484,18 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             entries = dict(owner.entries or ())
             if node.args:
                 source = self._expression_value(node.args[0])
-                for name, value in self._mapping_source_entries(source):
-                    entries[name] = (
-                        _join_values(entries.get(name, _UNKNOWN_VALUE), value)
-                        if name == "**"
-                        else value
-                    )
+                entries = self._overlay_mapping_entries(
+                    entries, dict(self._mapping_source_entries(source))
+                )
             for keyword in node.keywords:
                 value = self._expression_value(keyword.value)
                 if keyword.arg is None:
                     if value.entries is not None:
-                        entries.update(value.entries)
+                        entries = self._overlay_mapping_entries(entries, dict(value.entries))
                     else:
-                        entries["**"] = _join_values(
-                            entries.get("**", _UNKNOWN_VALUE),
-                            _conservative_value(value),
+                        entries = self._overlay_mapping_entries(
+                            entries,
+                            {_DYNAMIC_KEY: _conservative_value(value)},
                         )
                 else:
                     entries[_key_token(ast.Constant(keyword.arg))] = value
@@ -445,9 +512,17 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 return self._dynamic_setdefault_value(node)
             return _join_values(*values, default)
         token = _key_token(key)
-        selected = self._named_value(owner.entries, token)
+        entries = dict(owner.entries or ())
+        selected = entries.get(token)
+        wildcard = entries.get(_DYNAMIC_KEY)
         if method == "get":
-            return selected if selected is not None else default
+            if selected is not None:
+                return (
+                    _join_values(selected, default)
+                    if _MAPPING_MISSING in selected.origins
+                    else selected
+                )
+            return _join_values(wildcard, default) if wildcard is not None else default
 
         if method == "pop":
             if selected is not None and owner.entries is not None:
@@ -461,13 +536,15 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         # ``setdefault`` returns the existing value or inserts and returns the
         # default. A dynamic key may hit any existing entry or create a new
         # one, so join the default into every possible target and ``**``.
-        if selected is not None:
+        if selected is not None and _MAPPING_MISSING not in selected.origins:
             return selected
         if owner.entries is not None:
-            entries = dict(owner.entries)
-            entries[token] = default
+            prior = selected if selected is not None else wildcard
+            inserted = _join_values(prior, default) if prior is not None else default
+            entries[token] = inserted
             replacement = self._mapping_replacement(owner, sorted(entries.items()))
             self._replace_shared_value(owner, replacement, node.func.value)
+            return inserted
         return default
 
     def _dynamic_setdefault_value(self, node: ast.Call) -> _AbstractValue:
@@ -476,8 +553,8 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         values = self._mapping_values(owner)
         default = self._expression_value(node.args[1]) if len(node.args) >= 2 else _UNKNOWN_VALUE
         if owner.entries is not None:
-            entries = {name: _join_values(value, default) for name, value in owner.entries}
-            entries["**"] = _join_values(entries.get("**", _UNKNOWN_VALUE), default)
+            entries = dict(owner.entries)
+            entries[_DYNAMIC_KEY] = _join_values(entries.get(_DYNAMIC_KEY, _UNKNOWN_VALUE), default)
             replacement = self._mapping_replacement(owner, sorted(entries.items()))
             self._replace_shared_value(owner, replacement, node.func.value)
         return _join_values(*values, default)
@@ -552,19 +629,26 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                     attributes=tuple(attributes),
                 )
             if isinstance(node.func, ast.Name) and node.func.id == "dict":
-                entries: list[tuple[str, _AbstractValue]] = []
+                entries: dict[str, _AbstractValue] = {}
                 if node.args:
                     source = self._expression_value(node.args[0])
-                    entries.extend(self._mapping_source_entries(source))
+                    entries = self._overlay_mapping_entries(
+                        entries, dict(self._mapping_source_entries(source))
+                    )
                 for keyword in node.keywords:
                     value = self._expression_value(keyword.value)
                     if keyword.arg is not None:
-                        entries.append((_key_token(ast.Constant(keyword.arg)), value))
+                        entries[_key_token(ast.Constant(keyword.arg))] = value
                     elif value.entries is not None:
-                        entries.extend(value.entries)
+                        entries = self._overlay_mapping_entries(entries, dict(value.entries))
                     else:
-                        entries.append(("**", _conservative_value(value)))
-                return _AbstractValue(entries=tuple(entries), identity=frozenset({id(node)}))
+                        entries = self._overlay_mapping_entries(
+                            entries,
+                            {_DYNAMIC_KEY: _conservative_value(value)},
+                        )
+                return _AbstractValue(
+                    entries=tuple(sorted(entries.items())), identity=frozenset({id(node)})
+                )
             return _UNKNOWN_VALUE
         if isinstance(node, ast.Subscript):
             owner = self._expression_value(node.value)
@@ -576,9 +660,11 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                         return owner.items[node.slice.value]
                     except IndexError:
                         return _UNKNOWN_VALUE
-                entry = self._named_value(owner.entries, _key_token(node.slice))
+                entries = dict(owner.entries or ())
+                entry = entries.get(_key_token(node.slice))
                 if entry is not None:
                     return entry
+                return entries.get(_DYNAMIC_KEY, _UNKNOWN_VALUE)
             candidates = [*(owner.items or ()), *(value for _, value in owner.entries or ())]
             return _join_values(*candidates)
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
@@ -593,16 +679,22 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                     items.append(value)
             return _AbstractValue(items=tuple(items))
         if isinstance(node, ast.Dict):
-            entries: list[tuple[str, _AbstractValue]] = []
+            entries: dict[str, _AbstractValue] = {}
             for key, item in zip(node.keys, node.values, strict=True):
                 value = self._expression_value(item)
                 if key is not None:
-                    entries.append((_key_token(key), value))
+                    key_value = self._expression_value(key)
+                    self._add_mapping_entry(entries, key_value.literal or _DYNAMIC_KEY, value)
                 elif value.entries is not None:
-                    entries.extend(value.entries)
+                    entries = self._overlay_mapping_entries(entries, dict(value.entries))
                 else:
-                    entries.append(("**", _conservative_value(value)))
-            return _AbstractValue(entries=tuple(entries), identity=frozenset({id(node)}))
+                    entries = self._overlay_mapping_entries(
+                        entries,
+                        {_DYNAMIC_KEY: _conservative_value(value)},
+                    )
+            return _AbstractValue(
+                entries=tuple(sorted(entries.items())), identity=frozenset({id(node)})
+            )
         if isinstance(node, ast.IfExp):
             return _join_values(
                 self._expression_value(node.body), self._expression_value(node.orelse)
@@ -612,8 +704,9 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
             left = self._expression_value(node.left)
             right = self._expression_value(node.right)
-            entries = dict(left.entries or ())
-            entries.update(right.entries or ())
+            entries = self._overlay_mapping_entries(
+                dict(left.entries or ()), dict(right.entries or ())
+            )
             return _AbstractValue(
                 entries=tuple(sorted(entries.items())),
                 identity=frozenset({id(node)}),
@@ -734,8 +827,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         if isinstance(target.slice, ast.Constant):
             entries[_key_token(target.slice)] = value
         else:
-            entries = {name: _join_values(existing, value) for name, existing in entries.items()}
-            entries["**"] = _join_values(entries.get("**", _UNKNOWN_VALUE), value)
+            self._add_mapping_entry(entries, _DYNAMIC_KEY, value)
         replacement = self._mapping_replacement(owner, sorted(entries.items()))
         self._replace_shared_value(owner, replacement, target.value)
 
@@ -768,11 +860,11 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             right = self._expression_value(node.value)
             entries = dict(owner.entries or ())
             if right.entries is not None:
-                entries.update(right.entries)
+                entries = self._overlay_mapping_entries(entries, dict(right.entries))
             else:
-                entries["**"] = _join_values(
-                    entries.get("**", _UNKNOWN_VALUE),
-                    _conservative_value(right),
+                entries = self._overlay_mapping_entries(
+                    entries,
+                    {_DYNAMIC_KEY: _conservative_value(right)},
                 )
             replacement = self._mapping_replacement(owner, sorted(entries.items()))
             self._replace_shared_value(owner, replacement, node.target)

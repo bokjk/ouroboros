@@ -663,6 +663,104 @@ def unrelated_mutations(report, key):
     )
 
 
+def test_runtime_scan_models_dynamic_key_collisions_in_evaluation_order(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "dynamic_key_collisions.py").write_text(
+        """
+def dynamic_key_collisions(config, report, key):
+    preserved = {"known": report.evaluation}
+    preserved.setdefault(key, config.evaluation)
+    preserved_known_read = preserved["known"].satisfaction_threshold
+    for section in preserved.values():
+        inserted_default_read = section.stage1_enabled
+
+    later_dynamic = {
+        "known": report.evaluation,
+        key: config.evaluation,
+    }
+    later_dynamic_read = later_dynamic["known"].stage2_enabled
+
+    later_literal = {
+        key: config.evaluation,
+        "known": report.evaluation,
+    }
+    later_literal_read = later_literal["known"].satisfaction_threshold
+
+    updated = {"known": report.evaluation}
+    updated.update({key: config.evaluation})
+    updated_read = updated["known"].stage3_enabled
+
+    unioned = {"known": report.evaluation} | {key: config.evaluation}
+    unioned_read = unioned["known"].uncertainty_threshold
+
+    assigned = {"known": report.evaluation}
+    assigned[key] = config.evaluation
+    assigned_read = assigned["known"].assertion_extraction_model
+
+    missing = {"other": config.evaluation}
+    unreachable_missing_read = missing["known"].semantic_model
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+        }
+    )
+
+
+def test_runtime_scan_joins_dynamic_mapping_keys_and_missing_defaults(
+    contract, tmp_path: Path
+) -> None:
+    field = contract.ConfigField("evaluation", "stage1_enabled")
+    fields = frozenset({field})
+
+    positive = tmp_path / "positive"
+    positive.mkdir()
+    (positive / "conditional_mapping.py").write_text(
+        """
+def conditional_dynamic(config, report, key, enabled):
+    sections = {key: config.evaluation} if enabled else {"x": report.evaluation}
+    return sections["x"].stage1_enabled
+
+def conditional_default(config, report, enabled):
+    sections = {} if enabled else {"x": report.evaluation}
+    return sections.get("x", config.evaluation).stage1_enabled
+""",
+        encoding="utf-8",
+    )
+    assert contract.runtime_reads(positive, fields) == fields
+
+    negative = tmp_path / "negative"
+    negative.mkdir()
+    (negative / "missing_or_unrelated.py").write_text(
+        """
+def conditional_unrelated(report, enabled):
+    sections = {} if enabled else {"x": report.evaluation}
+    return sections["x"].stage1_enabled
+""",
+        encoding="utf-8",
+    )
+    assert contract.runtime_reads(negative, fields) == frozenset()
+
+
 def test_runtime_scan_keeps_provenance_when_mutating_a_may_alias(contract, tmp_path: Path) -> None:
     (tmp_path / "may_alias_mutation.py").write_text(
         """
