@@ -1610,6 +1610,276 @@ def constructed_system_exit_is_not_exception(config):
     )
 
 
+def test_runtime_scan_consumes_known_exceptions_in_first_matching_handler(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "ordered_known_handlers.py").write_text(
+        """
+def value_reader(value):
+    return value.devil_model
+
+def exception_reader(value):
+    return value.judge_model
+
+def tuple_reader(value):
+    return value.models
+
+def key_reader(value):
+    return value.threshold
+
+def outer_reader(value):
+    return value.diversity_required
+
+def unreachable_reader(value):
+    return value.min_models
+
+class CustomError(Exception):
+    pass
+
+def nested_inner_consumes(config):
+    handler = external
+    try:
+        try:
+            raise ValueError
+        except Exception:
+            pass
+    except BaseException:
+        handler = unreachable_reader
+    handler(config.consensus)
+
+def custom_error_is_consumed_by_base_exception(config):
+    handler = external
+    try:
+        try:
+            raise CustomError
+        except BaseException:
+            pass
+    except CustomError:
+        handler = unreachable_reader
+    handler(config.consensus)
+
+def custom_error_is_consumed_by_bare_handler(config):
+    handler = external
+    try:
+        try:
+            raise CustomError
+        except:
+            pass
+    except CustomError:
+        handler = unreachable_reader
+    handler(config.consensus)
+
+def value_error_uses_first_match(config):
+    handler = external
+    try:
+        raise ValueError
+    except ValueError:
+        handler = value_reader
+    except Exception:
+        handler = unreachable_reader
+    except:
+        handler = unreachable_reader
+    handler(config.consensus)
+
+def broader_handler_shadows_later_subclass(config):
+    handler = external
+    try:
+        raise ValueError
+    except Exception:
+        handler = exception_reader
+    except ValueError:
+        handler = unreachable_reader
+    handler(config.consensus)
+
+def tuple_uses_static_subclass_match(config):
+    handler = external
+    try:
+        raise KeyError
+    except (ValueError, LookupError):
+        handler = tuple_reader
+    except KeyError:
+        handler = unreachable_reader
+    except Exception:
+        handler = unreachable_reader
+    handler(config.consensus)
+
+def bare_reraise_retains_caught_type(config):
+    handler = external
+    try:
+        try:
+            raise KeyError
+        except (ValueError, LookupError):
+            raise
+    except KeyError:
+        handler = key_reader
+    except LookupError:
+        handler = unreachable_reader
+    handler(config.consensus)
+
+def handler_raise_bypasses_later_sibling(config):
+    handler = external
+    try:
+        try:
+            raise ValueError
+        except ValueError:
+            raise TypeError
+        except TypeError:
+            handler = unreachable_reader
+    except TypeError:
+        handler = outer_reader
+    handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "diversity_required"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "min_models"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "diversity_required"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+
+def test_runtime_scan_partitions_unknown_exceptions_without_shadowed_handlers(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "ordered_unknown_handlers.py").write_text(
+        """
+def value_reader(value):
+    return value.devil_model
+
+def exception_reader(value):
+    return value.judge_model
+
+def bare_reader(value):
+    return value.advocate_model
+
+def tuple_reader(value):
+    return value.models
+
+def key_reader(value):
+    return value.threshold
+
+def lookup_reader(value):
+    return value.diversity_required
+
+def unreachable_reader(value):
+    return value.min_models
+
+def partitions_all_domains(config, risky):
+    handler = external
+    try:
+        risky()
+    except ValueError:
+        handler = value_reader
+    except Exception:
+        handler = exception_reader
+    except:
+        handler = bare_reader
+    handler(config.consensus)
+
+def exception_shadows_value_error(config, risky):
+    handler = external
+    try:
+        risky()
+    except Exception:
+        handler = exception_reader
+    except ValueError:
+        handler = unreachable_reader
+    except:
+        handler = bare_reader
+    handler(config.consensus)
+
+def tuple_shadows_key_error(config, risky):
+    handler = external
+    try:
+        risky()
+    except (LookupError, ValueError):
+        handler = tuple_reader
+    except KeyError:
+        handler = unreachable_reader
+    except Exception:
+        handler = exception_reader
+    handler(config.consensus)
+
+def unknown_bare_reraise_keeps_caught_domain(config, risky):
+    handler = external
+    try:
+        try:
+            risky()
+        except LookupError:
+            raise
+    except KeyError:
+        handler = key_reader
+    except LookupError:
+        handler = lookup_reader
+    except Exception:
+        handler = exception_reader
+    handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "diversity_required"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "min_models"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "diversity_required"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+
+def test_runtime_scan_threads_bindings_through_except_star_subgroups(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "except_star_subgroups.py").write_text(
+        """
+def reader(value):
+    return value.min_models
+
+def sequential_subgroups(config, risky):
+    handler = external
+    try:
+        risky()
+    except* ValueError:
+        handler = reader
+    except* TypeError:
+        handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    field = contract.ConfigField("consensus", "min_models")
+
+    assert contract.runtime_reads(tmp_path, frozenset({field})) == frozenset({field})
+
+
 def test_runtime_scan_stops_after_unconditional_exit_but_keeps_dynamic_fallthrough(
     contract, tmp_path: Path
 ) -> None:

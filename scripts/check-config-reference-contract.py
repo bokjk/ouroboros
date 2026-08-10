@@ -19,6 +19,7 @@ it does nothing.
 from __future__ import annotations
 
 import ast
+import builtins
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import json
@@ -272,6 +273,8 @@ class _AbruptPath:
     bindings: _BindingSnapshot
     return_value: _AbstractValue | None = None
     exception_type: str | None = None
+    exception_exclusions: frozenset[str] = frozenset()
+    exception_upper_bound: str | None = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +299,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         self._flow_abrupts: list[list[_AbruptPath]] = [[]]
         self._path_reachable = True
         self._exception_capture_depth = 0
+        self._caught_exception_stack: list[tuple[_AbruptPath, ...]] = []
         self.reads: set[ConfigField] = set()
 
     def _name_value(self, name: str) -> _AbstractValue:
@@ -940,6 +944,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             _AbruptPath(
                 "raise",
                 self._join_binding_snapshots(before, self._binding_snapshot()),
+                exception_upper_bound="BaseException",
             ),
         )
 
@@ -1050,12 +1055,16 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 existing.kind == path.kind
                 and existing.return_value == path.return_value
                 and existing.exception_type == path.exception_type
+                and existing.exception_exclusions == path.exception_exclusions
+                and existing.exception_upper_bound == path.exception_upper_bound
             ):
                 target[index] = _AbruptPath(
                     path.kind,
                     self._join_binding_snapshots(existing.bindings, path.bindings),
                     path.return_value,
                     path.exception_type,
+                    path.exception_exclusions,
+                    path.exception_upper_bound,
                 )
                 return
         target.append(path)
@@ -1416,23 +1425,121 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         name = cls._exception_name(node)
         return frozenset({name.rsplit(".", 1)[-1]}) if name is not None else frozenset()
 
+    @staticmethod
+    def _builtin_exception_type(name: str) -> type[BaseException] | None:
+        candidate = getattr(builtins, name.rsplit(".", 1)[-1], None)
+        if isinstance(candidate, type) and issubclass(candidate, BaseException):
+            return candidate
+        return None
+
     @classmethod
-    def _handler_may_catch(cls, path: _AbruptPath, handler: ast.ExceptHandler) -> bool:
-        if path.kind != "raise":
-            return False
+    def _known_exception_subclass(cls, child: str, parent: str) -> bool | None:
+        child = child.rsplit(".", 1)[-1]
+        parent = parent.rsplit(".", 1)[-1]
+        if child == parent:
+            return True
+        if parent == "BaseException":
+            return True
+        child_type = cls._builtin_exception_type(child)
+        parent_type = cls._builtin_exception_type(parent)
+        if child_type is None or parent_type is None:
+            return None
+        return issubclass(child_type, parent_type)
+
+    @classmethod
+    def _exception_domain_intersection(cls, left: str, right: str) -> str | None:
+        if cls._known_exception_subclass(left, right) is True:
+            return left
+        if cls._known_exception_subclass(right, left) is True:
+            return right
+        left_type = cls._builtin_exception_type(left)
+        right_type = cls._builtin_exception_type(right)
+        if left_type is not None and right_type is not None:
+            return None
+        return right
+
+    @classmethod
+    def _exception_domain_excluded(cls, domain: str, exclusions: frozenset[str]) -> bool:
+        return any(
+            cls._known_exception_subclass(domain, excluded) is True for excluded in exclusions
+        )
+
+    @classmethod
+    def _partition_exception_path(
+        cls, path: _AbruptPath, handler: ast.ExceptHandler
+    ) -> tuple[tuple[_AbruptPath, ...], tuple[_AbruptPath, ...]]:
+        """Split one raise into this handler's caught and still-unmatched domains."""
+
         names = cls._handler_exception_names(handler.type)
-        if "BaseException" in names:
-            return True
-        if path.exception_type is None:
-            return True
-        raised = path.exception_type.rsplit(".", 1)[-1]
-        if raised in names:
-            return True
-        return "Exception" in names and raised not in {
-            "SystemExit",
-            "KeyboardInterrupt",
-            "GeneratorExit",
-        }
+        if not names:
+            return (path,), (path,)
+        if path.exception_type is not None:
+            raised = path.exception_type.rsplit(".", 1)[-1]
+            relations = {
+                name: cls._known_exception_subclass(raised, name)
+                for name in names
+                if name not in path.exception_exclusions
+            }
+            if any(relation is True for relation in relations.values()):
+                return (path,), ()
+            possible = frozenset(name for name, relation in relations.items() if relation is None)
+            if not possible:
+                return (), (path,)
+            remaining = _AbruptPath(
+                path.kind,
+                path.bindings,
+                path.return_value,
+                path.exception_type,
+                path.exception_exclusions | possible,
+                path.exception_upper_bound,
+            )
+            return (path,), (remaining,)
+
+        upper_bound = path.exception_upper_bound or "BaseException"
+        caught_domains: list[str] = []
+        feasible_names: set[str] = set()
+        fully_consumed = False
+        for name in names:
+            domain = cls._exception_domain_intersection(upper_bound, name)
+            if domain is None or cls._exception_domain_excluded(domain, path.exception_exclusions):
+                continue
+            feasible_names.add(name)
+            if cls._known_exception_subclass(upper_bound, name) is True:
+                fully_consumed = True
+            if any(
+                cls._known_exception_subclass(domain, existing) is True
+                for existing in caught_domains
+            ):
+                continue
+            caught_domains = [
+                existing
+                for existing in caught_domains
+                if cls._known_exception_subclass(existing, domain) is not True
+            ]
+            caught_domains.append(domain)
+        if not caught_domains:
+            return (), (path,)
+        caught = tuple(
+            _AbruptPath(
+                "raise",
+                path.bindings,
+                exception_exclusions=path.exception_exclusions,
+                exception_upper_bound=domain,
+            )
+            for domain in caught_domains
+        )
+        if fully_consumed:
+            return caught, ()
+        remaining_exclusions = path.exception_exclusions | feasible_names
+        if cls._exception_domain_excluded(upper_bound, remaining_exclusions):
+            return caught, ()
+        remaining = _AbruptPath(
+            "raise",
+            path.bindings,
+            exception_exclusions=remaining_exclusions,
+            exception_upper_bound=upper_bound,
+        )
+        return caught, (remaining,)
 
     def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
         self._exception_capture_depth += 1
@@ -1450,22 +1557,42 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             else _FlowResult(body_result.fallthrough)
         )
         handler_results: list[_FlowResult] = []
+        remaining_raises = [path for path in body_result.abrupt if path.kind == "raise"]
         for handler in node.handlers:
-            caught = [path for path in body_result.abrupt if self._handler_may_catch(path, handler)]
+            caught: list[_AbruptPath] = []
+            still_unmatched: list[_AbruptPath] = []
+            for path in remaining_raises:
+                caught_paths, remaining_paths = self._partition_exception_path(path, handler)
+                self._extend_abrupts(caught, caught_paths)
+                self._extend_abrupts(still_unmatched, remaining_paths)
+            remaining_raises = still_unmatched
             if not caught:
                 continue
-            self._restore_bindings(
-                self._join_binding_snapshots(*(path.bindings for path in caught))
-            )
+            handler_entries = [path.bindings for path in caught]
+            if isinstance(node, ast.TryStar):
+                handler_entries.extend(
+                    state
+                    for result in handler_results
+                    for state in (
+                        result.fallthrough,
+                        *(path.bindings for path in result.abrupt),
+                    )
+                    if state is not None
+                )
+            self._restore_bindings(self._join_binding_snapshots(*handler_entries))
             if handler.type is not None:
                 self.visit(handler.type)
             if handler.name is not None:
                 self._states[-1][handler.name] = _UNKNOWN_VALUE
                 self._functions[-1][handler.name] = frozenset()
                 self._annotations[-1][handler.name] = _UNKNOWN_VALUE
-            handler_results.append(
-                self._visit_binding_branch(handler.body, self._binding_snapshot())
-            )
+            self._caught_exception_stack.append(tuple(caught))
+            try:
+                handler_results.append(
+                    self._visit_binding_branch(handler.body, self._binding_snapshot())
+                )
+            finally:
+                self._caught_exception_stack.pop()
 
         fallthrough_paths = [
             state
@@ -1476,7 +1603,8 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             if state is not None
         ]
         abrupt = [
-            *body_result.abrupt,
+            *(path for path in body_result.abrupt if path.kind != "raise"),
+            *remaining_raises,
             *normal_result.abrupt,
             *(path for result in handler_results for path in result.abrupt),
         ]
@@ -1503,6 +1631,8 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                         abrupt_final.fallthrough,
                         path.return_value,
                         path.exception_type,
+                        path.exception_exclusions,
+                        path.exception_upper_bound,
                     )
                 )
             final_abrupt.extend(abrupt_final.abrupt)
@@ -2060,14 +2190,30 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 self.visit(node.exc)
         if node.cause is not None:
             self.visit(node.cause)
-        self._append_abrupt(
-            self._flow_abrupts[-1],
-            _AbruptPath(
-                "raise",
-                self._binding_snapshot(),
-                exception_type=self._exception_name(node.exc),
-            ),
-        )
+        bindings = self._binding_snapshot()
+        if node.exc is None and self._caught_exception_stack:
+            for caught in self._caught_exception_stack[-1]:
+                self._append_abrupt(
+                    self._flow_abrupts[-1],
+                    _AbruptPath(
+                        "raise",
+                        bindings,
+                        exception_type=caught.exception_type,
+                        exception_exclusions=caught.exception_exclusions,
+                        exception_upper_bound=caught.exception_upper_bound,
+                    ),
+                )
+        else:
+            exception_type = self._exception_name(node.exc)
+            self._append_abrupt(
+                self._flow_abrupts[-1],
+                _AbruptPath(
+                    "raise",
+                    bindings,
+                    exception_type=exception_type,
+                    exception_upper_bound=("BaseException" if exception_type is None else None),
+                ),
+            )
         self._path_reachable = False
 
     def visit_Break(self, node: ast.Break) -> None:
