@@ -942,6 +942,147 @@ async def async_context_names(manager):
     assert contract.runtime_reads(tmp_path, fields) == frozenset()
 
 
+def test_runtime_scan_excludes_static_dead_and_type_only_branches_without_pruning_dynamic(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "reachable_branches.py").write_text(
+        """
+from typing import TYPE_CHECKING as CHECKING
+import typing as typing_alias
+
+if CHECKING:
+    type_only_evaluation = config.evaluation.stage1_enabled
+if typing_alias.TYPE_CHECKING:
+    type_only_consensus = config.consensus.min_models
+if False:
+    dead_literal = config.evaluation.stage2_enabled
+if True:
+    live_literal = config.evaluation.stage3_enabled
+else:
+    dead_else = config.consensus.threshold
+if runtime_flag:
+    dynamic_body = config.evaluation.uncertainty_threshold
+else:
+    dynamic_else = config.consensus.models
+maybe_type_checking = CHECKING if runtime_flag else another_runtime_flag
+if maybe_type_checking:
+    dynamic_type_checking_collision = config.consensus.diversity_required
+
+dead_short_circuit = False and config.evaluation.satisfaction_threshold
+live_short_circuit = False or config.consensus.advocate_model
+dead_expression = (
+    config.consensus.devil_model if False else config.evaluation.semantic_model
+)
+while False:
+    dead_loop = config.consensus.judge_model
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "diversity_required"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "min_models"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "diversity_required"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+
+def test_runtime_scan_tracks_section_annotations_and_local_call_arguments_without_collisions(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "section_helpers.py").write_text(
+        """
+from typing import TYPE_CHECKING
+
+from ouroboros.config.models import ConsensusConfig, EvaluationConfig
+from ouroboros.evaluation.consensus import ConsensusConfig as RuntimeConsensusConfig
+
+EvaluationAlias = EvaluationConfig
+
+if TYPE_CHECKING:
+    from ouroboros.config.models import EvaluationConfig as EvaluationSection
+
+def typed_evaluation(section: EvaluationConfig):
+    return section.stage1_enabled
+
+def typed_consensus(section: ConsensusConfig | None):
+    return section.models
+
+def type_only_alias(section: EvaluationSection):
+    return section.stage2_enabled
+
+def assigned_alias(section: EvaluationAlias):
+    return section.assertion_extraction_model
+
+def untyped_helper(section):
+    return section.stage3_enabled
+
+def identity(section):
+    return section
+
+def caller(config):
+    untyped_helper(config.evaluation)
+    untyped_helper(**{"section": config.evaluation})
+    return identity(config.consensus).judge_model
+
+def colliding_runtime_type(section: RuntimeConsensusConfig):
+    return section.min_models
+
+def arbitrary_config_annotation(section: ProjectConfig):
+    return section.satisfaction_threshold
+
+def wrapped_section_is_not_the_section(sections: list[EvaluationConfig]):
+    return sections.uncertainty_threshold
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "min_models"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+
 def test_every_schema_field_needs_exactly_one_disposition(contract) -> None:
     active = contract.ConfigField("evaluation", "active")
     inert = contract.ConfigField("evaluation", "inert")
