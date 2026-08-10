@@ -1083,6 +1083,142 @@ def wrapped_section_is_not_the_section(sections: list[EvaluationConfig]):
     )
 
 
+def test_runtime_scan_keeps_local_call_cache_context_and_section_defaults(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "call_context.py").write_text(
+        """
+def identity(value):
+    return {"value": value}.get("value")
+
+cache_context_read = identity(config.evaluation).stage1_enabled
+
+def default_identity(value=config.evaluation):
+    return value
+
+default_read = default_identity().stage2_enabled
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == fields
+
+
+def test_runtime_scan_tracks_local_function_aliases_and_unknown_leading_star_args_but_rebinding(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "call_bindings.py").write_text(
+        """
+def aliased_reader(value):
+    return value.judge_model
+
+reader = aliased_reader
+aliased_reader = external
+alias_read = reader(config.consensus)
+
+def second_reader(prefix, value):
+    return value.models
+
+starred_read = second_reader(*unknown_args, config.consensus)
+
+def rebound_reader(value):
+    return value.min_models
+
+rebound_reader = external
+rebound_reader(config.consensus)
+
+def dynamic_reader(value):
+    return value.devil_model
+
+maybe_reader = external
+if runtime_flag:
+    maybe_reader = dynamic_reader
+maybe_reader(config.consensus)
+
+def statically_dead_reader(value):
+    return value.advocate_model
+
+dead_reader = external
+if False:
+    dead_reader = statically_dead_reader
+dead_reader(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "min_models"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+
+def test_runtime_scan_stops_after_unconditional_exit_but_keeps_dynamic_fallthrough(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "terminators.py").write_text(
+        """
+def direct_return(config):
+    return None
+    dead_read = config.evaluation.satisfaction_threshold
+
+def direct_raise(config):
+    raise RuntimeError
+    dead_read = config.consensus.min_models
+
+def both_branches_exit(config, enabled):
+    if enabled:
+        return None
+    else:
+        raise RuntimeError
+    dead_read = config.consensus.threshold
+
+def dynamic_fallthrough(config, enabled):
+    if enabled:
+        return None
+    live_read = config.evaluation.uncertainty_threshold
+
+def terminating_alias_path(config, report, enabled):
+    section = report.evaluation
+    if enabled:
+        section = config.evaluation
+        return None
+    unrelated_fallthrough = section.stage1_enabled
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "min_models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {contract.ConfigField("evaluation", "uncertainty_threshold")}
+    )
+
+
 def test_every_schema_field_needs_exactly_one_disposition(contract) -> None:
     active = contract.ConfigField("evaluation", "active")
     inert = contract.ConfigField("evaluation", "inert")

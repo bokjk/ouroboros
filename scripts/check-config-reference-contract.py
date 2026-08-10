@@ -255,6 +255,8 @@ def _key_token(node: ast.AST) -> str:
 
 _DYNAMIC_KEY = "**"
 _MAPPING_MISSING = "<mapping-missing>"
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+_FunctionSet = frozenset[_FunctionNode]
 
 
 class _RuntimeReadVisitor(ast.NodeVisitor):
@@ -265,7 +267,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         # Explicit unknown values shadow name-based config inference.
         self._states: list[dict[str, _AbstractValue]] = [{}]
         self._annotations: list[dict[str, _AbstractValue]] = [{}]
-        self._functions: list[dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = [{}]
+        self._functions: list[dict[str, _FunctionSet]] = [{}]
         self._active_calls: set[int] = set()
         self._return_values: list[list[_AbstractValue]] = []
         self._expression_cache: dict[int, _AbstractValue] = {}
@@ -346,13 +348,27 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         parts.append(node.id)
         return ".".join(reversed(parts))
 
-    def _local_function(self, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    def _local_functions(self, name: str) -> _FunctionSet:
         for scope in reversed(self._functions):
             if name in scope:
                 return scope[name]
-        return None
+        return frozenset()
 
-    def _call_has_config_provenance(self, node: ast.Call) -> bool:
+    def _function_value(self, node: ast.AST) -> _FunctionSet:
+        if isinstance(node, ast.Name):
+            return self._local_functions(node.id)
+        if isinstance(node, ast.IfExp):
+            truth = self._static_truth(node.test)
+            if truth is not None:
+                return self._function_value(node.body if truth else node.orelse)
+            return self._function_value(node.body) | self._function_value(node.orelse)
+        return frozenset()
+
+    def _call_has_config_provenance(
+        self,
+        node: ast.Call,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> bool:
         values = [
             self._expression_value(
                 argument.value if isinstance(argument, ast.Starred) else argument
@@ -360,6 +376,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             for argument in node.args
         ]
         values.extend(self._expression_value(keyword.value) for keyword in node.keywords)
+        values.extend(self._scoped_function_arguments(function).values())
         tracked = TRACKED_SECTIONS | {_CONFIG_ROOT}
         return any(_contained_origins(value) & tracked for value in values)
 
@@ -796,9 +813,16 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                     entries=tuple(sorted(entries.items())), identity=frozenset({id(node)})
                 )
             if isinstance(node.func, ast.Name):
-                function = self._local_function(node.func.id)
-                if function is not None and self._call_has_config_provenance(node):
-                    return self._local_call_value(node, function)
+                functions = self._local_functions(node.func.id)
+                values = [
+                    self._local_call_value(node, function)
+                    for function in functions
+                    if self._call_has_config_provenance(node, function)
+                ]
+                if values:
+                    value = _join_values(*values)
+                    self._expression_cache[id(node)] = value
+                    return value
             return _UNKNOWN_VALUE
         if isinstance(node, ast.Subscript):
             owner = self._expression_value(node.value)
@@ -921,6 +945,26 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             for name in names
         }
 
+    @staticmethod
+    def _join_function_bindings(
+        *states: Mapping[str, _FunctionSet],
+    ) -> dict[str, _FunctionSet]:
+        names = set().union(*(state.keys() for state in states))
+        return {
+            name: frozenset().union(*(state.get(name, frozenset()) for state in states))
+            for name in names
+        }
+
+    @staticmethod
+    def _join_annotation_bindings(
+        *states: Mapping[str, _AbstractValue],
+    ) -> dict[str, _AbstractValue]:
+        names = set().union(*(state.keys() for state in states))
+        return {
+            name: _join_values(*(state.get(name, _UNKNOWN_VALUE) for state in states))
+            for name in names
+        }
+
     def _bind_target_value(self, target: ast.expr, value: _AbstractValue) -> None:
         if isinstance(target, ast.Name):
             self._states[-1][target.id] = value
@@ -936,6 +980,17 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         elif isinstance(target, (ast.Tuple, ast.List)):
             for element in target.elts:
                 self._bind_annotation_target(element, _UNKNOWN_VALUE)
+
+    def _bind_function_target(
+        self,
+        target: ast.expr,
+        functions: _FunctionSet,
+    ) -> None:
+        if isinstance(target, ast.Name):
+            self._functions[-1][target.id] = functions
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self._bind_function_target(element, frozenset())
 
     def _bind_destructured(self, target: ast.expr, value: _AbstractValue) -> None:
         if isinstance(target, ast.Name):
@@ -1012,14 +1067,17 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         self.visit(node.value)
         value = self._expression_value(node.value)
         annotation_value = self._annotation_value(node.value)
+        function = self._function_value(node.value)
         for target in node.targets:
             self._visit_store_target(target)
             self._assign_store_target(target, value)
             self._bind_destructured(target, value)
             self._bind_annotation_target(target, annotation_value)
+            self._bind_function_target(target, function)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         self.visit(node.annotation)
+        self._bind_function_target(node.target, frozenset())
         if node.value is not None:
             self.visit(node.value)
             self._visit_store_target(node.target)
@@ -1027,10 +1085,12 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self._assign_store_target(node.target, value)
             self._bind_destructured(node.target, value)
             self._bind_annotation_target(node.target, self._annotation_value(node.value))
+            self._bind_function_target(node.target, self._function_value(node.value))
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
         self._bind_destructured(node.target, self._expression_value(node.value))
+        self._bind_function_target(node.target, self._function_value(node.value))
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         owner = self._expression_value(node.target)
@@ -1051,6 +1111,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             return
         if isinstance(node.target, ast.Name):
             self._states[-1][node.target.id] = self._name_value(node.target.id)
+            self._functions[-1][node.target.id] = frozenset()
 
     def _visit_branch(
         self,
@@ -1059,8 +1120,31 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
     ) -> dict[str, _AbstractValue]:
         self._states[-1] = dict(initial)
         for statement in statements:
+            terminates = self._statement_always_terminates(statement)
             self.visit(statement)
+            if terminates:
+                break
         return dict(self._states[-1])
+
+    def _statements_always_terminate(self, statements: Iterable[ast.stmt]) -> bool:
+        return any(self._statement_always_terminates(statement) for statement in statements)
+
+    def _statement_always_terminates(self, statement: ast.stmt) -> bool:
+        if isinstance(statement, (ast.Return, ast.Raise)):
+            return True
+        if isinstance(statement, ast.If):
+            truth = self._static_truth(statement.test)
+            if truth is not None:
+                branch = statement.body if truth else statement.orelse
+                return self._statements_always_terminate(branch)
+            return (
+                bool(statement.orelse)
+                and self._statements_always_terminate(statement.body)
+                and self._statements_always_terminate(statement.orelse)
+            )
+        if isinstance(statement, (ast.With, ast.AsyncWith)):
+            return self._statements_always_terminate(statement.body)
+        return False
 
     def _visit_paths(
         self,
@@ -1070,8 +1154,11 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         self._states[-1] = dict(initial)
         prefixes = dict(initial)
         for statement in statements:
+            terminates = self._statement_always_terminates(statement)
             self.visit(statement)
             prefixes = self._join_states(prefixes, self._states[-1])
+            if terminates:
+                break
         return dict(self._states[-1]), prefixes
 
     def visit_If(self, node: ast.If) -> None:
@@ -1085,9 +1172,47 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 self._register_type_only_imports(dead_branch)
             self._states[-1] = self._visit_branch(live_branch, initial)
             return
+        initial_functions = dict(self._functions[-1])
+        initial_annotations = dict(self._annotations[-1])
+        body_terminates = self._statements_always_terminate(node.body)
+        else_terminates = bool(node.orelse) and self._statements_always_terminate(node.orelse)
         body_state = self._visit_branch(node.body, initial)
+        body_functions = dict(self._functions[-1])
+        body_annotations = dict(self._annotations[-1])
+        self._functions[-1] = dict(initial_functions)
+        self._annotations[-1] = dict(initial_annotations)
         else_state = self._visit_branch(node.orelse, initial) if node.orelse else initial
-        self._states[-1] = self._join_states(body_state, else_state)
+        else_functions = dict(self._functions[-1])
+        else_annotations = dict(self._annotations[-1])
+        state_paths = [
+            state
+            for state, terminates in (
+                (body_state, body_terminates),
+                (else_state, else_terminates),
+            )
+            if not terminates
+        ]
+        function_paths = [
+            state
+            for state, terminates in (
+                (body_functions, body_terminates),
+                (else_functions, else_terminates),
+            )
+            if not terminates
+        ]
+        annotation_paths = [
+            state
+            for state, terminates in (
+                (body_annotations, body_terminates),
+                (else_annotations, else_terminates),
+            )
+            if not terminates
+        ]
+        self._states[-1] = self._join_states(*(state_paths or [initial]))
+        self._functions[-1] = self._join_function_bindings(*(function_paths or [initial_functions]))
+        self._annotations[-1] = self._join_annotation_bindings(
+            *(annotation_paths or [initial_annotations])
+        )
 
     @staticmethod
     def _iteration_values(value: _AbstractValue) -> tuple[_AbstractValue, ...]:
@@ -1106,6 +1231,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         for candidate in candidates:
             self._states[-1] = dict(initial)
             self._bind_destructured(target, candidate)
+            self._bind_function_target(target, frozenset())
             candidate_states.append(dict(self._states[-1]))
         self._states[-1] = self._join_states(*candidate_states)
         return True
@@ -1403,6 +1529,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             )
             self._annotations[-1][bound] = annotation_value
             if runtime:
+                self._functions[-1][bound] = frozenset()
                 self._states[-1][bound] = (
                     _origin_value(_TYPING_MODULE) if alias.name == "typing" else _UNKNOWN_VALUE
                 )
@@ -1414,6 +1541,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             bound = alias.asname or alias.name
             self._annotations[-1][bound] = self._imported_annotation(node.module, alias.name)
             if runtime:
+                self._functions[-1][bound] = frozenset()
                 self._states[-1][bound] = (
                     _type_checking_value()
                     if node.module == "typing" and alias.name == "TYPE_CHECKING"
@@ -1461,12 +1589,49 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             scoped[arguments.kwarg.arg] = self._argument_value(arguments.kwarg)
         return scoped
 
+    def _default_argument_values(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> dict[str, _AbstractValue]:
+        previous_cache = self._expression_cache
+        self._expression_cache = {}
+        try:
+            positional = (*node.args.posonlyargs, *node.args.args)
+            defaulted = positional[-len(node.args.defaults) :] if node.args.defaults else ()
+            values = {
+                argument.arg: self._expression_value(default)
+                for argument, default in zip(
+                    defaulted,
+                    node.args.defaults,
+                    strict=True,
+                )
+            }
+            values.update(
+                {
+                    argument.arg: self._expression_value(default)
+                    for argument, default in zip(
+                        node.args.kwonlyargs, node.args.kw_defaults, strict=True
+                    )
+                    if default is not None
+                }
+            )
+            return values
+        finally:
+            self._expression_cache = previous_cache
+
+    def _scoped_function_arguments(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> dict[str, _AbstractValue]:
+        scoped = self._scoped_arguments(node.args)
+        for name, value in self._default_argument_values(node).items():
+            scoped[name] = _join_values(scoped[name], value)
+        return scoped
+
     @staticmethod
     def _declared_functions(
         statements: Iterable[ast.stmt],
-    ) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    ) -> dict[str, _FunctionSet]:
         return {
-            statement.name: statement
+            statement.name: frozenset({statement})
             for statement in statements
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
@@ -1478,28 +1643,68 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
     ) -> dict[str, _AbstractValue]:
         arguments = function.args
         scoped = self._scoped_arguments(arguments)
+        scoped.update(self._default_argument_values(function))
         positional_parameters = (*arguments.posonlyargs, *arguments.args)
-        positional_values: list[_AbstractValue] = []
-        unknown_starred: _AbstractValue | None = None
+        positional_states: list[
+            tuple[int, dict[str, _AbstractValue], tuple[_AbstractValue, ...]]
+        ] = [(0, {}, ())]
+
+        def bind_positional(
+            states: list[tuple[int, dict[str, _AbstractValue], tuple[_AbstractValue, ...]]],
+            value: _AbstractValue,
+        ) -> list[tuple[int, dict[str, _AbstractValue], tuple[_AbstractValue, ...]]]:
+            bound: list[tuple[int, dict[str, _AbstractValue], tuple[_AbstractValue, ...]]] = []
+            for index, bindings, extras in states:
+                if index < len(positional_parameters):
+                    updated = dict(bindings)
+                    updated[positional_parameters[index].arg] = value
+                    bound.append((index + 1, updated, extras))
+                elif arguments.vararg is not None:
+                    bound.append((index, bindings, (*extras, value)))
+            return bound
+
         for argument in call.args:
             if isinstance(argument, ast.Starred):
                 expanded = self._expression_value(argument.value)
                 if expanded.items is not None:
-                    positional_values.extend(expanded.items)
+                    for value in expanded.items:
+                        positional_states = bind_positional(positional_states, value)
                 else:
-                    unknown_starred = _conservative_value(expanded)
-                    positional_values.append(unknown_starred)
+                    conservative = _conservative_value(expanded)
+                    expanded_states: list[
+                        tuple[
+                            int,
+                            dict[str, _AbstractValue],
+                            tuple[_AbstractValue, ...],
+                        ]
+                    ] = []
+                    for state in positional_states:
+                        alternatives = [state]
+                        current = [state]
+                        while current and current[0][0] < len(positional_parameters):
+                            current = bind_positional(current, conservative)
+                            alternatives.extend(current)
+                        if arguments.vararg is not None and current:
+                            alternatives.extend(bind_positional(current, conservative))
+                        expanded_states.extend(alternatives)
+                    positional_states = expanded_states
             else:
-                positional_values.append(self._expression_value(argument))
+                positional_states = bind_positional(
+                    positional_states, self._expression_value(argument)
+                )
 
-        for parameter, value in zip(positional_parameters, positional_values, strict=False):
-            scoped[parameter.arg] = value
-        if unknown_starred is not None:
-            for parameter in positional_parameters[len(positional_values) :]:
-                scoped[parameter.arg] = _join_values(scoped[parameter.arg], unknown_starred)
-        if arguments.vararg is not None:
+        for parameter in positional_parameters:
+            scoped[parameter.arg] = _join_values(
+                *(
+                    bindings.get(parameter.arg, scoped[parameter.arg])
+                    for _, bindings, _ in positional_states
+                )
+            )
+        if arguments.vararg is not None and positional_states:
             scoped[arguments.vararg.arg] = _AbstractValue(
-                items=tuple(positional_values[len(positional_parameters) :])
+                items=(
+                    _join_values(*(item for _, _, extras in positional_states for item in extras)),
+                )
             )
 
         named_parameters = {
@@ -1541,13 +1746,32 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
     ) -> tuple[_AbstractValue, ...]:
         self._states.append(scoped)
         self._annotations.append({})
-        self._functions.append(self._declared_functions(node.body))
+        function_bindings: dict[str, _FunctionSet] = {
+            argument.arg: frozenset()
+            for argument in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
+        }
+        if node.args.vararg is not None:
+            function_bindings[node.args.vararg.arg] = frozenset()
+        if node.args.kwarg is not None:
+            function_bindings[node.args.kwarg.arg] = frozenset()
+        function_bindings.update(self._declared_functions(node.body))
+        self._functions.append(function_bindings)
         self._return_values.append([])
+        previous_cache = self._expression_cache
+        self._expression_cache = {}
         try:
             for statement in node.body:
+                terminates = self._statement_always_terminates(statement)
                 self.visit(statement)
+                if terminates:
+                    break
             return tuple(self._return_values[-1])
         finally:
+            self._expression_cache = previous_cache
             self._return_values.pop()
             self._functions.pop()
             self._annotations.pop()
@@ -1583,16 +1807,16 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         for default in (*node.args.defaults, *node.args.kw_defaults):
             if default is not None:
                 self.visit(default)
-        self._visit_function_body(node, self._scoped_arguments(node.args))
+        self._visit_function_body(node, self._scoped_function_arguments(node))
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._functions[-1][node.name] = node
+        self._functions[-1][node.name] = frozenset({node})
         self._visit_scoped(node)
         self._states[-1][node.name] = _UNKNOWN_VALUE
         self._annotations[-1][node.name] = _UNKNOWN_VALUE
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._functions[-1][node.name] = node
+        self._functions[-1][node.name] = frozenset({node})
         self._visit_scoped(node)
         self._states[-1][node.name] = _UNKNOWN_VALUE
         self._annotations[-1][node.name] = _UNKNOWN_VALUE
@@ -1619,6 +1843,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self._states.pop()
         self._states[-1][node.name] = _UNKNOWN_VALUE
         self._annotations[-1][node.name] = _UNKNOWN_VALUE
+        self._functions[-1][node.name] = frozenset()
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         for default in (*node.args.defaults, *node.args.kw_defaults):
