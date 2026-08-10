@@ -257,6 +257,11 @@ _DYNAMIC_KEY = "**"
 _MAPPING_MISSING = "<mapping-missing>"
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
 _FunctionSet = frozenset[_FunctionNode]
+_BindingSnapshot = tuple[
+    dict[str, _AbstractValue],
+    dict[str, _FunctionSet],
+    dict[str, _AbstractValue],
+]
 
 
 class _RuntimeReadVisitor(ast.NodeVisitor):
@@ -965,6 +970,56 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             for name in names
         }
 
+    def _binding_snapshot(self) -> _BindingSnapshot:
+        return (
+            dict(self._states[-1]),
+            dict(self._functions[-1]),
+            dict(self._annotations[-1]),
+        )
+
+    def _restore_bindings(self, snapshot: _BindingSnapshot) -> None:
+        state, functions, annotations = snapshot
+        self._states[-1] = dict(state)
+        self._functions[-1] = dict(functions)
+        self._annotations[-1] = dict(annotations)
+
+    def _join_binding_snapshots(self, *snapshots: _BindingSnapshot) -> _BindingSnapshot:
+        return (
+            self._join_states(*(snapshot[0] for snapshot in snapshots)),
+            self._join_function_bindings(*(snapshot[1] for snapshot in snapshots)),
+            self._join_annotation_bindings(*(snapshot[2] for snapshot in snapshots)),
+        )
+
+    def _visit_binding_branch(
+        self,
+        statements: Iterable[ast.stmt],
+        initial: _BindingSnapshot,
+    ) -> _BindingSnapshot:
+        self._restore_bindings(initial)
+        for statement in statements:
+            terminates = self._statement_always_terminates(statement)
+            self.visit(statement)
+            if terminates:
+                break
+        return self._binding_snapshot()
+
+    def _visit_binding_paths(
+        self,
+        statements: Iterable[ast.stmt],
+        initial: _BindingSnapshot,
+    ) -> tuple[_BindingSnapshot, _BindingSnapshot]:
+        """Return normal completion and every feasible exception prefix."""
+
+        self._restore_bindings(initial)
+        prefixes = initial
+        for statement in statements:
+            terminates = self._statement_always_terminates(statement)
+            self.visit(statement)
+            prefixes = self._join_binding_snapshots(prefixes, self._binding_snapshot())
+            if terminates:
+                break
+        return self._binding_snapshot(), prefixes
+
     def _bind_target_value(self, target: ast.expr, value: _AbstractValue) -> None:
         if isinstance(target, ast.Name):
             self._states[-1][target.id] = value
@@ -1144,22 +1199,28 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             )
         if isinstance(statement, (ast.With, ast.AsyncWith)):
             return self._statements_always_terminate(statement.body)
+        if isinstance(statement, (ast.Try, ast.TryStar)):
+            if statement.finalbody and self._statements_always_terminate(statement.finalbody):
+                return True
+            normal_terminates = self._statements_always_terminate(statement.body) or (
+                bool(statement.orelse) and self._statements_always_terminate(statement.orelse)
+            )
+            return normal_terminates and all(
+                self._statements_always_terminate(handler.body) for handler in statement.handlers
+            )
+        if isinstance(statement, ast.Match):
+            return self._match_is_exhaustive(statement) and all(
+                self._statements_always_terminate(case.body) for case in statement.cases
+            )
         return False
 
-    def _visit_paths(
-        self,
-        statements: Iterable[ast.stmt],
-        initial: dict[str, _AbstractValue],
-    ) -> tuple[dict[str, _AbstractValue], dict[str, _AbstractValue]]:
-        self._states[-1] = dict(initial)
-        prefixes = dict(initial)
-        for statement in statements:
-            terminates = self._statement_always_terminates(statement)
-            self.visit(statement)
-            prefixes = self._join_states(prefixes, self._states[-1])
-            if terminates:
-                break
-        return dict(self._states[-1]), prefixes
+    def _match_is_exhaustive(self, node: ast.Match) -> bool:
+        return any(
+            isinstance(case.pattern, ast.MatchAs)
+            and case.pattern.pattern is None
+            and (case.guard is None or self._static_truth(case.guard) is True)
+            for case in node.cases
+        )
 
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
@@ -1232,6 +1293,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self._states[-1] = dict(initial)
             self._bind_destructured(target, candidate)
             self._bind_function_target(target, frozenset())
+            self._bind_annotation_target(target, _UNKNOWN_VALUE)
             candidate_states.append(dict(self._states[-1]))
         self._states[-1] = self._join_states(*candidate_states)
         return True
@@ -1239,65 +1301,99 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
     def visit_For(self, node: ast.For) -> None:
         self.visit(node.iter)
         iterable = self._expression_value(node.iter)
-        entry = dict(self._states[-1])
-        self._states[-1] = dict(entry)
+        zero_iterations_possible = self._static_truth(node.iter) is not True
+        entry = self._binding_snapshot()
+        self._restore_bindings(entry)
         if not self._bind_iteration_target(node.target, iterable):
-            self._states[-1] = self._visit_branch(node.orelse, entry) if node.orelse else entry
+            completed = self._visit_binding_branch(node.orelse, entry) if node.orelse else entry
+            self._restore_bindings(completed)
             return
         header = entry
+        body_terminates = self._statements_always_terminate(node.body)
         while True:
-            self._states[-1] = dict(header)
+            self._restore_bindings(header)
             self._bind_iteration_target(node.target, iterable)
-            body_state = self._visit_branch(node.body, dict(self._states[-1]))
-            joined = self._join_states(entry, body_state)
+            body_state = self._visit_binding_branch(node.body, self._binding_snapshot())
+            paths = ([] if not zero_iterations_possible else [entry]) + (
+                [] if body_terminates else [body_state]
+            )
+            joined = self._join_binding_snapshots(*(paths or [body_state]))
             if joined == header:
                 break
             header = joined
-        else_state = self._visit_branch(node.orelse, header) if node.orelse else header
-        self._states[-1] = self._join_states(header, body_state, else_state)
+        else_state = self._visit_binding_branch(node.orelse, header) if node.orelse else header
+        self._restore_bindings(else_state)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit_For(node)
 
     def visit_While(self, node: ast.While) -> None:
-        entry = dict(self._states[-1])
+        entry = self._binding_snapshot()
         self.visit(node.test)
-        if self._static_truth(node.test) is False:
-            tested_state = dict(self._states[-1])
-            self._states[-1] = (
-                self._visit_branch(node.orelse, tested_state) if node.orelse else tested_state
+        truth = self._static_truth(node.test)
+        if truth is False:
+            tested_state = self._binding_snapshot()
+            completed = (
+                self._visit_binding_branch(node.orelse, tested_state)
+                if node.orelse
+                else tested_state
             )
+            self._restore_bindings(completed)
             return
         header = entry
+        body_terminates = self._statements_always_terminate(node.body)
         while True:
-            self._states[-1] = dict(header)
+            self._restore_bindings(header)
             self.visit(node.test)
-            tested_state = dict(self._states[-1])
-            body_state = self._visit_branch(node.body, tested_state)
-            joined = self._join_states(entry, body_state)
+            tested_state = self._binding_snapshot()
+            body_state = self._visit_binding_branch(node.body, tested_state)
+            paths = ([] if truth is True else [entry]) + ([] if body_terminates else [body_state])
+            joined = self._join_binding_snapshots(*(paths or [body_state]))
             if joined == header:
                 break
             header = joined
-        else_state = self._visit_branch(node.orelse, tested_state) if node.orelse else tested_state
-        self._states[-1] = self._join_states(tested_state, body_state, else_state)
+        self._restore_bindings(header)
+        self.visit(node.test)
+        tested_state = self._binding_snapshot()
+        else_state = (
+            self._visit_binding_branch(node.orelse, tested_state)
+            if node.orelse and truth is not True
+            else tested_state
+        )
+        self._restore_bindings(else_state)
 
     def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
-        entry = dict(self._states[-1])
-        body_state, exception_states = self._visit_paths(node.body, entry)
-        normal_state = self._visit_branch(node.orelse, body_state) if node.orelse else body_state
-        completed = [normal_state]
+        entry = self._binding_snapshot()
+        body_state, exception_states = self._visit_binding_paths(node.body, entry)
+        normal_state = (
+            self._visit_binding_branch(node.orelse, body_state) if node.orelse else body_state
+        )
+        normal_terminates = self._statements_always_terminate(node.body) or (
+            bool(node.orelse) and self._statements_always_terminate(node.orelse)
+        )
+        completed = [] if normal_terminates else [normal_state]
         for handler in node.handlers:
-            self._states[-1] = dict(exception_states)
+            self._restore_bindings(exception_states)
             if handler.type is not None:
                 self.visit(handler.type)
             if handler.name is not None:
                 self._states[-1][handler.name] = _UNKNOWN_VALUE
-            completed.append(self._visit_branch(handler.body, dict(self._states[-1])))
+                self._functions[-1][handler.name] = frozenset()
+                self._annotations[-1][handler.name] = _UNKNOWN_VALUE
+            handler_state = self._visit_binding_branch(handler.body, self._binding_snapshot())
+            if not self._statements_always_terminate(handler.body):
+                completed.append(handler_state)
         if node.finalbody:
-            incoming = self._join_states(exception_states, *completed)
-            self._states[-1] = self._visit_branch(node.finalbody, incoming)
+            incoming = self._join_binding_snapshots(exception_states, *completed)
+            all_final_state = self._visit_binding_branch(node.finalbody, incoming)
+            final_state = (
+                self._visit_binding_branch(node.finalbody, self._join_binding_snapshots(*completed))
+                if completed
+                else all_final_state
+            )
+            self._restore_bindings(final_state)
         else:
-            self._states[-1] = self._join_states(*completed)
+            self._restore_bindings(self._join_binding_snapshots(*(completed or [entry])))
 
     def visit_Try(self, node: ast.Try) -> None:
         self._visit_try(node)
@@ -1332,10 +1428,14 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 self._bind_pattern(pattern.pattern, subject)
             if pattern.name is not None:
                 self._states[-1][pattern.name] = subject
+                self._functions[-1][pattern.name] = frozenset()
+                self._annotations[-1][pattern.name] = _UNKNOWN_VALUE
             return
         if isinstance(pattern, ast.MatchStar):
             if pattern.name is not None:
                 self._states[-1][pattern.name] = subject
+                self._functions[-1][pattern.name] = frozenset()
+                self._annotations[-1][pattern.name] = _UNKNOWN_VALUE
             return
         if isinstance(pattern, ast.MatchOr):
             initial = dict(self._states[-1])
@@ -1366,6 +1466,8 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 self._states[-1][pattern.rest] = _AbstractValue(
                     entries=remaining, identity=frozenset({id(pattern)})
                 )
+                self._functions[-1][pattern.rest] = frozenset()
+                self._annotations[-1][pattern.rest] = _UNKNOWN_VALUE
             return
         if isinstance(pattern, ast.MatchClass):
             fallback = _conservative_value(subject)
@@ -1422,18 +1524,30 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
     def visit_Match(self, node: ast.Match) -> None:
         self.visit(node.subject)
         subject = self._expression_value(node.subject)
-        initial = dict(self._states[-1])
-        branches = [initial]
+        initial = self._binding_snapshot()
+        branches: list[_BindingSnapshot] = []
+        unmatched = True
         for case in node.cases:
-            self._states[-1] = dict(initial)
+            self._restore_bindings(initial)
             self._visit_pattern_reads(case.pattern)
             self._bind_pattern(case.pattern, subject)
             if case.guard is not None:
                 self.visit(case.guard)
                 if self._static_truth(case.guard) is False:
                     continue
-            branches.append(self._visit_branch(case.body, dict(self._states[-1])))
-        self._states[-1] = self._join_states(*branches)
+            branch = self._visit_binding_branch(case.body, self._binding_snapshot())
+            if not self._statements_always_terminate(case.body):
+                branches.append(branch)
+            if (
+                isinstance(case.pattern, ast.MatchAs)
+                and case.pattern.pattern is None
+                and (case.guard is None or self._static_truth(case.guard) is True)
+            ):
+                unmatched = False
+                break
+        if unmatched:
+            branches.append(initial)
+        self._restore_bindings(self._join_binding_snapshots(*(branches or [initial])))
 
     def _visit_comprehension(
         self,

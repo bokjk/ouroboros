@@ -1170,6 +1170,135 @@ dead_reader(config.consensus)
     )
 
 
+def test_runtime_scan_joins_callable_bindings_across_compound_statement_paths(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "callable_control_flow.py").write_text(
+        """
+def for_reader(value):
+    return value.judge_model
+
+def for_zero_iteration(config, unknown_items):
+    handler = for_reader
+    for item in unknown_items:
+        handler = external
+    return handler(config.consensus)
+
+def while_reader(value):
+    return value.models
+
+def while_zero_iteration(config, enabled):
+    handler = while_reader
+    while enabled:
+        handler = external
+    return handler(config.consensus)
+
+def try_reader(value):
+    return value.devil_model
+
+def try_success(config, risky):
+    handler = try_reader
+    try:
+        risky()
+    except RuntimeError:
+        handler = external
+    return handler(config.consensus)
+
+def match_reader(value):
+    return value.advocate_model
+
+def match_unmatched(config, selector):
+    handler = match_reader
+    match selector:
+        case 0:
+            handler = external
+    return handler(config.consensus)
+
+def unreachable_reader(value):
+    return value.min_models
+
+def terminating_paths_do_not_escape(config, report, selector, risky):
+    handler = external
+    for _ in unknown_items:
+        handler = unreachable_reader
+        return None
+    handler(config.consensus)
+
+    try:
+        risky()
+    except RuntimeError:
+        handler = unreachable_reader
+        return None
+    handler(config.consensus)
+
+    match selector:
+        case 0:
+            handler = unreachable_reader
+            return None
+        case _:
+            handler = external
+    handler(config.consensus)
+
+def exhaustive_shadowing(config, selector):
+    handler = unreachable_reader
+    match selector:
+        case 0:
+            handler = external
+        case _:
+            handler = external
+    return handler(config.consensus)
+
+def exhaustive_termination(config, selector):
+    handler = unreachable_reader
+    match selector:
+        case 0:
+            return None
+        case _ if True:
+            raise RuntimeError
+    handler(config.consensus)
+
+def try_termination(config, risky):
+    handler = unreachable_reader
+    try:
+        return risky()
+    except RuntimeError:
+        raise
+    handler(config.consensus)
+
+def guaranteed_iteration_shadowing(config):
+    handler = unreachable_reader
+    for _ in [1]:
+        handler = external
+    handler(config.consensus)
+
+    handler = unreachable_reader
+    while True:
+        handler = external
+        break
+    handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "min_models"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+
 def test_runtime_scan_stops_after_unconditional_exit_but_keeps_dynamic_fallthrough(
     contract, tmp_path: Path
 ) -> None:
