@@ -1431,6 +1431,185 @@ def return_and_raise_do_not_reach_after_loop(config, items, enabled):
     assert contract.runtime_reads(tmp_path, frozenset({nested, unreachable})) == frozenset({nested})
 
 
+def test_runtime_scan_does_not_route_return_or_continue_into_except_handlers(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "non_exception_abrupts.py").write_text(
+        """
+def unreachable_reader(value):
+    return value.min_models
+
+def bare_return(config):
+    handler = unreachable_reader
+    try:
+        return
+    except Exception:
+        pass
+    handler(config.consensus)
+
+def for_continue(config, items):
+    handler = external
+    for _ in items:
+        try:
+            handler = unreachable_reader
+            continue
+        except Exception:
+            break
+        else:
+            handler = external
+    else:
+        handler = external
+    handler(config.consensus)
+
+def while_continue(config, enabled):
+    handler = external
+    while enabled:
+        try:
+            handler = unreachable_reader
+            continue
+        except Exception:
+            break
+        else:
+            handler = external
+    else:
+        handler = external
+    handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    field = contract.ConfigField("consensus", "min_models")
+
+    assert contract.runtime_reads(tmp_path, frozenset({field})) == frozenset()
+
+
+def test_runtime_scan_finally_return_overrides_prior_return_provenance(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "finally_return_authority.py").write_text(
+        """
+def choose(config, report):
+    try:
+        return config.consensus
+    finally:
+        return report.consensus
+
+overridden_read = choose(config, report).min_models
+
+def choose_from_except(config, report, risky):
+    try:
+        risky()
+    except Exception:
+        return config.consensus
+    else:
+        return config.consensus
+    finally:
+        return report.consensus
+
+overridden_except_read = choose_from_except(config, report, risky).threshold
+
+def preserved(config):
+    try:
+        return config.consensus
+    finally:
+        pass
+
+preserved_read = preserved(config).models
+
+def nested_override(config, report):
+    try:
+        try:
+            return config.consensus
+        finally:
+            return report.consensus
+    finally:
+        pass
+
+nested_overridden_read = nested_override(config, report).diversity_required
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("consensus", "diversity_required"),
+            contract.ConfigField("consensus", "min_models"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {contract.ConfigField("consensus", "models")}
+    )
+
+
+def test_runtime_scan_keeps_raise_break_and_system_exit_abrupt_kinds_distinct(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "abrupt_kinds.py").write_text(
+        """
+def raised_reader(value):
+    return value.devil_model
+
+def break_reader(value):
+    return value.judge_model
+
+def unreachable_reader(value):
+    return value.advocate_model
+
+def explicit_raise(config):
+    handler = external
+    try:
+        raise RuntimeError
+    except Exception:
+        handler = raised_reader
+    handler(config.consensus)
+
+def break_skips_handler_and_else(config, items):
+    handler = external
+    for _ in items:
+        try:
+            handler = break_reader
+            break
+        except Exception:
+            handler = external
+    else:
+        handler = external
+    handler(config.consensus)
+
+def system_exit_is_not_exception(config):
+    handler = external
+    try:
+        raise SystemExit
+    except Exception:
+        handler = unreachable_reader
+    handler(config.consensus)
+
+def constructed_system_exit_is_not_exception(config):
+    handler = external
+    try:
+        raise SystemExit()
+    except Exception:
+        handler = unreachable_reader
+    handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("consensus", "advocate_model"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+        }
+    )
+
+
 def test_runtime_scan_stops_after_unconditional_exit_but_keeps_dynamic_fallthrough(
     contract, tmp_path: Path
 ) -> None:

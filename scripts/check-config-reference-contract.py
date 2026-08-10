@@ -262,7 +262,16 @@ _BindingSnapshot = tuple[
     dict[str, _FunctionSet],
     dict[str, _AbstractValue],
 ]
-_AbruptPath = tuple[str, _BindingSnapshot]
+
+
+@dataclass(frozen=True)
+class _AbruptPath:
+    """One non-fallthrough control path and its path-local payload."""
+
+    kind: str
+    bindings: _BindingSnapshot
+    return_value: _AbstractValue | None = None
+    exception_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -283,10 +292,10 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         self._annotations: list[dict[str, _AbstractValue]] = [{}]
         self._functions: list[dict[str, _FunctionSet]] = [{}]
         self._active_calls: set[int] = set()
-        self._return_values: list[list[_AbstractValue]] = []
         self._expression_cache: dict[int, _AbstractValue] = {}
         self._flow_abrupts: list[list[_AbruptPath]] = [[]]
         self._path_reachable = True
+        self._exception_capture_depth = 0
         self.reads: set[ConfigField] = set()
 
     def _name_value(self, name: str) -> _AbstractValue:
@@ -921,11 +930,27 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         if field in self._fields:
             self.reads.add(field)
 
+    def _record_possible_exception(self, before: _BindingSnapshot) -> None:
+        """Preserve a feasible exception edge without ending normal evaluation."""
+
+        if self._exception_capture_depth == 0:
+            return
+        self._append_abrupt(
+            self._flow_abrupts[-1],
+            _AbruptPath(
+                "raise",
+                self._join_binding_snapshots(before, self._binding_snapshot()),
+            ),
+        )
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        before = self._binding_snapshot()
         if isinstance(node.ctx, ast.Load):
             for section in self._expression_value(node.value).origins & TRACKED_SECTIONS:
                 self._record(section, node.attr)
         self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load):
+            self._record_possible_exception(before)
 
     def visit_IfExp(self, node: ast.IfExp) -> None:
         self.visit(node.test)
@@ -941,6 +966,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self.visit(value)
 
     def visit_Call(self, node: ast.Call) -> None:
+        before = self._binding_snapshot()
         # Evaluate once even when the call is a standalone mutating
         # ``setdefault`` expression.
         self._expression_value(node)
@@ -954,6 +980,13 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             for section in self._expression_value(node.args[0]).origins & TRACKED_SECTIONS:
                 self._record(section, node.args[1].value)
         self.generic_visit(node)
+        self._record_possible_exception(before)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        before = self._binding_snapshot()
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load):
+            self._record_possible_exception(before)
 
     @staticmethod
     def _join_states(
@@ -1011,8 +1044,28 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         paths = tuple(snapshots)
         return self._join_binding_snapshots(*paths) if paths else None
 
+    def _append_abrupt(self, target: list[_AbruptPath], path: _AbruptPath) -> None:
+        for index, existing in enumerate(target):
+            if (
+                existing.kind == path.kind
+                and existing.return_value == path.return_value
+                and existing.exception_type == path.exception_type
+            ):
+                target[index] = _AbruptPath(
+                    path.kind,
+                    self._join_binding_snapshots(existing.bindings, path.bindings),
+                    path.return_value,
+                    path.exception_type,
+                )
+                return
+        target.append(path)
+
+    def _extend_abrupts(self, target: list[_AbruptPath], paths: Iterable[_AbruptPath]) -> None:
+        for path in paths:
+            self._append_abrupt(target, path)
+
     def _apply_flow_result(self, result: _FlowResult) -> None:
-        self._flow_abrupts[-1].extend(result.abrupt)
+        self._extend_abrupts(self._flow_abrupts[-1], result.abrupt)
         self._path_reachable = result.fallthrough is not None
         if result.fallthrough is not None:
             self._restore_bindings(result.fallthrough)
@@ -1036,43 +1089,6 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             return _FlowResult(
                 self._binding_snapshot() if self._path_reachable else None,
                 tuple(self._flow_abrupts[-1]),
-            )
-        finally:
-            self._flow_abrupts.pop()
-            self._expression_cache = previous_cache
-            self._path_reachable = previous_reachable
-
-    def _visit_binding_paths(
-        self,
-        statements: Iterable[ast.stmt],
-        initial: _BindingSnapshot,
-    ) -> tuple[_FlowResult, _BindingSnapshot]:
-        """Return normal completion and every feasible exception prefix."""
-
-        previous_reachable = self._path_reachable
-        previous_cache = self._expression_cache
-        self._restore_bindings(initial)
-        self._path_reachable = True
-        self._flow_abrupts.append([])
-        self._expression_cache = {}
-        prefixes = initial
-        try:
-            for statement in statements:
-                self.visit(statement)
-                current_abrupt = self._flow_abrupts[-1]
-                observed = [snapshot for _, snapshot in current_abrupt]
-                if self._path_reachable:
-                    observed.append(self._binding_snapshot())
-                if observed:
-                    prefixes = self._join_binding_snapshots(prefixes, *observed)
-                if not self._path_reachable:
-                    break
-            return (
-                _FlowResult(
-                    self._binding_snapshot() if self._path_reachable else None,
-                    tuple(self._flow_abrupts[-1]),
-                ),
-                prefixes,
             )
         finally:
             self._flow_abrupts.pop()
@@ -1298,7 +1314,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self._restore_bindings(header)
             self._bind_iteration_target(node.target, iterable)
             body_result = self._visit_binding_branch(node.body, self._binding_snapshot())
-            back_edges = [snapshot for kind, snapshot in body_result.abrupt if kind == "continue"]
+            back_edges = [path.bindings for path in body_result.abrupt if path.kind == "continue"]
             if body_result.fallthrough is not None:
                 back_edges.append(body_result.fallthrough)
             joined = self._join_binding_snapshots(entry, *back_edges)
@@ -1313,9 +1329,9 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             if node.orelse and normal_entry is not None
             else _FlowResult(normal_entry)
         )
-        break_paths = [snapshot for kind, snapshot in body_result.abrupt if kind == "break"]
+        break_paths = [path.bindings for path in body_result.abrupt if path.kind == "break"]
         outer_abrupt = tuple(
-            path for path in body_result.abrupt if path[0] not in {"break", "continue"}
+            path for path in body_result.abrupt if path.kind not in {"break", "continue"}
         )
         post_paths = [*break_paths]
         if normal_result.fallthrough is not None:
@@ -1349,7 +1365,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self.visit(node.test)
             tested_state = self._binding_snapshot()
             body_result = self._visit_binding_branch(node.body, tested_state)
-            back_edges = [snapshot for kind, snapshot in body_result.abrupt if kind == "continue"]
+            back_edges = [path.bindings for path in body_result.abrupt if path.kind == "continue"]
             if body_result.fallthrough is not None:
                 back_edges.append(body_result.fallthrough)
             joined = self._join_binding_snapshots(entry, *back_edges)
@@ -1367,9 +1383,9 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             if node.orelse and normal_entry is not None
             else _FlowResult(normal_entry)
         )
-        break_paths = [snapshot for kind, snapshot in body_result.abrupt if kind == "break"]
+        break_paths = [path.bindings for path in body_result.abrupt if path.kind == "break"]
         outer_abrupt = tuple(
-            path for path in body_result.abrupt if path[0] not in {"break", "continue"}
+            path for path in body_result.abrupt if path.kind not in {"break", "continue"}
         )
         post_paths = [*break_paths]
         if normal_result.fallthrough is not None:
@@ -1381,9 +1397,53 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             )
         )
 
+    @classmethod
+    def _exception_name(cls, node: ast.AST | None) -> str | None:
+        if isinstance(node, ast.Call):
+            return cls._exception_name(node.func)
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return cls._dotted_name(node)
+        return None
+
+    @classmethod
+    def _handler_exception_names(cls, node: ast.AST | None) -> frozenset[str]:
+        if node is None:
+            return frozenset({"BaseException"})
+        if isinstance(node, ast.Tuple):
+            return frozenset().union(*(cls._handler_exception_names(item) for item in node.elts))
+        name = cls._exception_name(node)
+        return frozenset({name.rsplit(".", 1)[-1]}) if name is not None else frozenset()
+
+    @classmethod
+    def _handler_may_catch(cls, path: _AbruptPath, handler: ast.ExceptHandler) -> bool:
+        if path.kind != "raise":
+            return False
+        names = cls._handler_exception_names(handler.type)
+        if "BaseException" in names:
+            return True
+        if path.exception_type is None:
+            return True
+        raised = path.exception_type.rsplit(".", 1)[-1]
+        if raised in names:
+            return True
+        return "Exception" in names and raised not in {
+            "SystemExit",
+            "KeyboardInterrupt",
+            "GeneratorExit",
+        }
+
     def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
+        self._exception_capture_depth += 1
+        try:
+            self._visit_try_paths(node)
+        finally:
+            self._exception_capture_depth -= 1
+
+    def _visit_try_paths(self, node: ast.Try | ast.TryStar) -> None:
         entry = self._binding_snapshot()
-        body_result, exception_states = self._visit_binding_paths(node.body, entry)
+        body_result = self._visit_binding_branch(node.body, entry)
         normal_result = (
             self._visit_binding_branch(node.orelse, body_result.fallthrough)
             if node.orelse and body_result.fallthrough is not None
@@ -1391,7 +1451,12 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         )
         handler_results: list[_FlowResult] = []
         for handler in node.handlers:
-            self._restore_bindings(exception_states)
+            caught = [path for path in body_result.abrupt if self._handler_may_catch(path, handler)]
+            if not caught:
+                continue
+            self._restore_bindings(
+                self._join_binding_snapshots(*(path.bindings for path in caught))
+            )
             if handler.type is not None:
                 self.visit(handler.type)
             if handler.name is not None:
@@ -1414,7 +1479,6 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             *body_result.abrupt,
             *normal_result.abrupt,
             *(path for result in handler_results for path in result.abrupt),
-            ("raise", exception_states),
         ]
         if not node.finalbody:
             self._apply_flow_result(
@@ -1430,13 +1494,17 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             )
             final_fallthrough = completed_final.fallthrough
             final_abrupt.extend(completed_final.abrupt)
-        for kind in {path_kind for path_kind, _ in abrupt}:
-            incoming = self._join_binding_snapshots(
-                *(snapshot for path_kind, snapshot in abrupt if path_kind == kind)
-            )
-            abrupt_final = self._visit_binding_branch(node.finalbody, incoming)
+        for path in abrupt:
+            abrupt_final = self._visit_binding_branch(node.finalbody, path.bindings)
             if abrupt_final.fallthrough is not None:
-                final_abrupt.append((kind, abrupt_final.fallthrough))
+                final_abrupt.append(
+                    _AbruptPath(
+                        path.kind,
+                        abrupt_final.fallthrough,
+                        path.return_value,
+                        path.exception_type,
+                    )
+                )
             final_abrupt.extend(abrupt_final.abrupt)
         self._apply_flow_result(_FlowResult(final_fallthrough, tuple(final_abrupt)))
 
@@ -1925,15 +1993,17 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             function_bindings[node.args.kwarg.arg] = frozenset()
         function_bindings.update(self._declared_functions(node.body))
         self._functions.append(function_bindings)
-        self._return_values.append([])
         previous_cache = self._expression_cache
         self._expression_cache = {}
         try:
-            self._visit_binding_branch(node.body, self._binding_snapshot())
-            return tuple(self._return_values[-1])
+            result = self._visit_binding_branch(node.body, self._binding_snapshot())
+            return tuple(
+                path.return_value or _UNKNOWN_VALUE
+                for path in result.abrupt
+                if path.kind == "return"
+            )
         finally:
             self._expression_cache = previous_cache
-            self._return_values.pop()
             self._functions.pop()
             self._annotations.pop()
             self._states.pop()
@@ -1958,25 +2028,60 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
     def visit_Return(self, node: ast.Return) -> None:
         if node.value is not None:
             self.visit(node.value)
-        if node.value is not None and self._return_values:
-            self._return_values[-1].append(self._expression_value(node.value))
-        self._flow_abrupts[-1].append(("return", self._binding_snapshot()))
+        value = self._expression_value(node.value) if node.value is not None else _UNKNOWN_VALUE
+        self._append_abrupt(
+            self._flow_abrupts[-1],
+            _AbruptPath("return", self._binding_snapshot(), return_value=value),
+        )
         self._path_reachable = False
 
     def visit_Raise(self, node: ast.Raise) -> None:
         if node.exc is not None:
-            self.visit(node.exc)
+            exception_name = self._exception_name(node.exc)
+            leaf = exception_name.rsplit(".", 1)[-1] if exception_name else ""
+            if isinstance(node.exc, ast.Call) and (
+                leaf.endswith(("Error", "Exception"))
+                or leaf
+                in {
+                    "BaseException",
+                    "GeneratorExit",
+                    "KeyboardInterrupt",
+                    "StopAsyncIteration",
+                    "StopIteration",
+                    "SystemExit",
+                }
+            ):
+                self.visit(node.exc.func)
+                for argument in node.exc.args:
+                    self.visit(argument)
+                for keyword in node.exc.keywords:
+                    self.visit(keyword.value)
+            else:
+                self.visit(node.exc)
         if node.cause is not None:
             self.visit(node.cause)
-        self._flow_abrupts[-1].append(("raise", self._binding_snapshot()))
+        self._append_abrupt(
+            self._flow_abrupts[-1],
+            _AbruptPath(
+                "raise",
+                self._binding_snapshot(),
+                exception_type=self._exception_name(node.exc),
+            ),
+        )
         self._path_reachable = False
 
     def visit_Break(self, node: ast.Break) -> None:
-        self._flow_abrupts[-1].append(("break", self._binding_snapshot()))
+        self._append_abrupt(
+            self._flow_abrupts[-1],
+            _AbruptPath("break", self._binding_snapshot()),
+        )
         self._path_reachable = False
 
     def visit_Continue(self, node: ast.Continue) -> None:
-        self._flow_abrupts[-1].append(("continue", self._binding_snapshot()))
+        self._append_abrupt(
+            self._flow_abrupts[-1],
+            _AbruptPath("continue", self._binding_snapshot()),
+        )
         self._path_reachable = False
 
     def _visit_scoped(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
