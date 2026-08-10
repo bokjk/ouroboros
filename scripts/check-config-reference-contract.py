@@ -262,6 +262,15 @@ _BindingSnapshot = tuple[
     dict[str, _FunctionSet],
     dict[str, _AbstractValue],
 ]
+_AbruptPath = tuple[str, _BindingSnapshot]
+
+
+@dataclass(frozen=True)
+class _FlowResult:
+    """Binding paths leaving one statement suite."""
+
+    fallthrough: _BindingSnapshot | None
+    abrupt: tuple[_AbruptPath, ...] = ()
 
 
 class _RuntimeReadVisitor(ast.NodeVisitor):
@@ -276,6 +285,8 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         self._active_calls: set[int] = set()
         self._return_values: list[list[_AbstractValue]] = []
         self._expression_cache: dict[int, _AbstractValue] = {}
+        self._flow_abrupts: list[list[_AbruptPath]] = [[]]
+        self._path_reachable = True
         self.reads: set[ConfigField] = set()
 
     def _name_value(self, name: str) -> _AbstractValue:
@@ -847,32 +858,36 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             candidates = [*(owner.items or ()), *(value for _, value in owner.entries or ())]
             return _join_values(*candidates)
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-            items: list[_AbstractValue] = []
+            sequence_items: list[_AbstractValue] = []
             for element in node.elts:
                 value = self._expression_value(
                     element.value if isinstance(element, ast.Starred) else element
                 )
                 if isinstance(element, ast.Starred) and value.items is not None:
-                    items.extend(value.items)
+                    sequence_items.extend(value.items)
                 else:
-                    items.append(value)
-            return _AbstractValue(items=tuple(items), truth=self._static_truth(node))
+                    sequence_items.append(value)
+            return _AbstractValue(items=tuple(sequence_items), truth=self._static_truth(node))
         if isinstance(node, ast.Dict):
-            entries: dict[str, _AbstractValue] = {}
+            literal_entries: dict[str, _AbstractValue] = {}
             for key, item in zip(node.keys, node.values, strict=True):
                 value = self._expression_value(item)
                 if key is not None:
                     key_value = self._expression_value(key)
-                    self._add_mapping_entry(entries, key_value.literal or _DYNAMIC_KEY, value)
+                    self._add_mapping_entry(
+                        literal_entries, key_value.literal or _DYNAMIC_KEY, value
+                    )
                 elif value.entries is not None:
-                    entries = self._overlay_mapping_entries(entries, dict(value.entries))
+                    literal_entries = self._overlay_mapping_entries(
+                        literal_entries, dict(value.entries)
+                    )
                 else:
-                    entries = self._overlay_mapping_entries(
-                        entries,
+                    literal_entries = self._overlay_mapping_entries(
+                        literal_entries,
                         {_DYNAMIC_KEY: _conservative_value(value)},
                     )
             return _AbstractValue(
-                entries=tuple(sorted(entries.items())),
+                entries=tuple(sorted(literal_entries.items())),
                 identity=frozenset({id(node)}),
                 truth=self._static_truth(node),
             )
@@ -990,35 +1005,79 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self._join_annotation_bindings(*(snapshot[2] for snapshot in snapshots)),
         )
 
+    def _join_optional_bindings(
+        self, snapshots: Iterable[_BindingSnapshot]
+    ) -> _BindingSnapshot | None:
+        paths = tuple(snapshots)
+        return self._join_binding_snapshots(*paths) if paths else None
+
+    def _apply_flow_result(self, result: _FlowResult) -> None:
+        self._flow_abrupts[-1].extend(result.abrupt)
+        self._path_reachable = result.fallthrough is not None
+        if result.fallthrough is not None:
+            self._restore_bindings(result.fallthrough)
+
     def _visit_binding_branch(
         self,
         statements: Iterable[ast.stmt],
         initial: _BindingSnapshot,
-    ) -> _BindingSnapshot:
+    ) -> _FlowResult:
+        previous_reachable = self._path_reachable
+        previous_cache = self._expression_cache
         self._restore_bindings(initial)
-        for statement in statements:
-            terminates = self._statement_always_terminates(statement)
-            self.visit(statement)
-            if terminates:
-                break
-        return self._binding_snapshot()
+        self._path_reachable = True
+        self._flow_abrupts.append([])
+        self._expression_cache = {}
+        try:
+            for statement in statements:
+                self.visit(statement)
+                if not self._path_reachable:
+                    break
+            return _FlowResult(
+                self._binding_snapshot() if self._path_reachable else None,
+                tuple(self._flow_abrupts[-1]),
+            )
+        finally:
+            self._flow_abrupts.pop()
+            self._expression_cache = previous_cache
+            self._path_reachable = previous_reachable
 
     def _visit_binding_paths(
         self,
         statements: Iterable[ast.stmt],
         initial: _BindingSnapshot,
-    ) -> tuple[_BindingSnapshot, _BindingSnapshot]:
+    ) -> tuple[_FlowResult, _BindingSnapshot]:
         """Return normal completion and every feasible exception prefix."""
 
+        previous_reachable = self._path_reachable
+        previous_cache = self._expression_cache
         self._restore_bindings(initial)
+        self._path_reachable = True
+        self._flow_abrupts.append([])
+        self._expression_cache = {}
         prefixes = initial
-        for statement in statements:
-            terminates = self._statement_always_terminates(statement)
-            self.visit(statement)
-            prefixes = self._join_binding_snapshots(prefixes, self._binding_snapshot())
-            if terminates:
-                break
-        return self._binding_snapshot(), prefixes
+        try:
+            for statement in statements:
+                self.visit(statement)
+                current_abrupt = self._flow_abrupts[-1]
+                observed = [snapshot for _, snapshot in current_abrupt]
+                if self._path_reachable:
+                    observed.append(self._binding_snapshot())
+                if observed:
+                    prefixes = self._join_binding_snapshots(prefixes, *observed)
+                if not self._path_reachable:
+                    break
+            return (
+                _FlowResult(
+                    self._binding_snapshot() if self._path_reachable else None,
+                    tuple(self._flow_abrupts[-1]),
+                ),
+                prefixes,
+            )
+        finally:
+            self._flow_abrupts.pop()
+            self._expression_cache = previous_cache
+            self._path_reachable = previous_reachable
 
     def _bind_target_value(self, target: ast.expr, value: _AbstractValue) -> None:
         if isinstance(target, ast.Name):
@@ -1168,111 +1227,33 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             self._states[-1][node.target.id] = self._name_value(node.target.id)
             self._functions[-1][node.target.id] = frozenset()
 
-    def _visit_branch(
-        self,
-        statements: Iterable[ast.stmt],
-        initial: dict[str, _AbstractValue],
-    ) -> dict[str, _AbstractValue]:
-        self._states[-1] = dict(initial)
-        for statement in statements:
-            terminates = self._statement_always_terminates(statement)
-            self.visit(statement)
-            if terminates:
-                break
-        return dict(self._states[-1])
-
-    def _statements_always_terminate(self, statements: Iterable[ast.stmt]) -> bool:
-        return any(self._statement_always_terminates(statement) for statement in statements)
-
-    def _statement_always_terminates(self, statement: ast.stmt) -> bool:
-        if isinstance(statement, (ast.Return, ast.Raise)):
-            return True
-        if isinstance(statement, ast.If):
-            truth = self._static_truth(statement.test)
-            if truth is not None:
-                branch = statement.body if truth else statement.orelse
-                return self._statements_always_terminate(branch)
-            return (
-                bool(statement.orelse)
-                and self._statements_always_terminate(statement.body)
-                and self._statements_always_terminate(statement.orelse)
-            )
-        if isinstance(statement, (ast.With, ast.AsyncWith)):
-            return self._statements_always_terminate(statement.body)
-        if isinstance(statement, (ast.Try, ast.TryStar)):
-            if statement.finalbody and self._statements_always_terminate(statement.finalbody):
-                return True
-            normal_terminates = self._statements_always_terminate(statement.body) or (
-                bool(statement.orelse) and self._statements_always_terminate(statement.orelse)
-            )
-            return normal_terminates and all(
-                self._statements_always_terminate(handler.body) for handler in statement.handlers
-            )
-        if isinstance(statement, ast.Match):
-            return self._match_is_exhaustive(statement) and all(
-                self._statements_always_terminate(case.body) for case in statement.cases
-            )
-        return False
-
-    def _match_is_exhaustive(self, node: ast.Match) -> bool:
-        return any(
-            isinstance(case.pattern, ast.MatchAs)
-            and case.pattern.pattern is None
-            and (case.guard is None or self._static_truth(case.guard) is True)
-            for case in node.cases
-        )
-
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
-        initial = dict(self._states[-1])
+        initial = self._binding_snapshot()
         truth = self._static_truth(node.test)
         if truth is not None:
             live_branch = node.body if truth else node.orelse
             dead_branch = node.orelse if truth else node.body
             if self._uses_type_checking(node.test):
                 self._register_type_only_imports(dead_branch)
-            self._states[-1] = self._visit_branch(live_branch, initial)
+                initial = self._binding_snapshot()
+            self._apply_flow_result(self._visit_binding_branch(live_branch, initial))
             return
-        initial_functions = dict(self._functions[-1])
-        initial_annotations = dict(self._annotations[-1])
-        body_terminates = self._statements_always_terminate(node.body)
-        else_terminates = bool(node.orelse) and self._statements_always_terminate(node.orelse)
-        body_state = self._visit_branch(node.body, initial)
-        body_functions = dict(self._functions[-1])
-        body_annotations = dict(self._annotations[-1])
-        self._functions[-1] = dict(initial_functions)
-        self._annotations[-1] = dict(initial_annotations)
-        else_state = self._visit_branch(node.orelse, initial) if node.orelse else initial
-        else_functions = dict(self._functions[-1])
-        else_annotations = dict(self._annotations[-1])
-        state_paths = [
-            state
-            for state, terminates in (
-                (body_state, body_terminates),
-                (else_state, else_terminates),
+        body_result = self._visit_binding_branch(node.body, initial)
+        else_result = (
+            self._visit_binding_branch(node.orelse, initial)
+            if node.orelse
+            else _FlowResult(initial)
+        )
+        self._apply_flow_result(
+            _FlowResult(
+                self._join_optional_bindings(
+                    state
+                    for state in (body_result.fallthrough, else_result.fallthrough)
+                    if state is not None
+                ),
+                (*body_result.abrupt, *else_result.abrupt),
             )
-            if not terminates
-        ]
-        function_paths = [
-            state
-            for state, terminates in (
-                (body_functions, body_terminates),
-                (else_functions, else_terminates),
-            )
-            if not terminates
-        ]
-        annotation_paths = [
-            state
-            for state, terminates in (
-                (body_annotations, body_terminates),
-                (else_annotations, else_terminates),
-            )
-            if not terminates
-        ]
-        self._states[-1] = self._join_states(*(state_paths or [initial]))
-        self._functions[-1] = self._join_function_bindings(*(function_paths or [initial_functions]))
-        self._annotations[-1] = self._join_annotation_bindings(
-            *(annotation_paths or [initial_annotations])
         )
 
     @staticmethod
@@ -1305,24 +1286,46 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         entry = self._binding_snapshot()
         self._restore_bindings(entry)
         if not self._bind_iteration_target(node.target, iterable):
-            completed = self._visit_binding_branch(node.orelse, entry) if node.orelse else entry
-            self._restore_bindings(completed)
+            completed = (
+                self._visit_binding_branch(node.orelse, entry)
+                if node.orelse
+                else _FlowResult(entry)
+            )
+            self._apply_flow_result(completed)
             return
         header = entry
-        body_terminates = self._statements_always_terminate(node.body)
         while True:
             self._restore_bindings(header)
             self._bind_iteration_target(node.target, iterable)
-            body_state = self._visit_binding_branch(node.body, self._binding_snapshot())
-            paths = ([] if not zero_iterations_possible else [entry]) + (
-                [] if body_terminates else [body_state]
-            )
-            joined = self._join_binding_snapshots(*(paths or [body_state]))
+            body_result = self._visit_binding_branch(node.body, self._binding_snapshot())
+            back_edges = [snapshot for kind, snapshot in body_result.abrupt if kind == "continue"]
+            if body_result.fallthrough is not None:
+                back_edges.append(body_result.fallthrough)
+            joined = self._join_binding_snapshots(entry, *back_edges)
             if joined == header:
                 break
             header = joined
-        else_state = self._visit_binding_branch(node.orelse, header) if node.orelse else header
-        self._restore_bindings(else_state)
+
+        normal_paths = ([] if not zero_iterations_possible else [entry]) + back_edges
+        normal_entry = self._join_optional_bindings(normal_paths)
+        normal_result = (
+            self._visit_binding_branch(node.orelse, normal_entry)
+            if node.orelse and normal_entry is not None
+            else _FlowResult(normal_entry)
+        )
+        break_paths = [snapshot for kind, snapshot in body_result.abrupt if kind == "break"]
+        outer_abrupt = tuple(
+            path for path in body_result.abrupt if path[0] not in {"break", "continue"}
+        )
+        post_paths = [*break_paths]
+        if normal_result.fallthrough is not None:
+            post_paths.append(normal_result.fallthrough)
+        self._apply_flow_result(
+            _FlowResult(
+                self._join_optional_bindings(post_paths),
+                (*outer_abrupt, *normal_result.abrupt),
+            )
+        )
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit_For(node)
@@ -1336,42 +1339,57 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             completed = (
                 self._visit_binding_branch(node.orelse, tested_state)
                 if node.orelse
-                else tested_state
+                else _FlowResult(tested_state)
             )
-            self._restore_bindings(completed)
+            self._apply_flow_result(completed)
             return
         header = entry
-        body_terminates = self._statements_always_terminate(node.body)
         while True:
             self._restore_bindings(header)
             self.visit(node.test)
             tested_state = self._binding_snapshot()
-            body_state = self._visit_binding_branch(node.body, tested_state)
-            paths = ([] if truth is True else [entry]) + ([] if body_terminates else [body_state])
-            joined = self._join_binding_snapshots(*(paths or [body_state]))
+            body_result = self._visit_binding_branch(node.body, tested_state)
+            back_edges = [snapshot for kind, snapshot in body_result.abrupt if kind == "continue"]
+            if body_result.fallthrough is not None:
+                back_edges.append(body_result.fallthrough)
+            joined = self._join_binding_snapshots(entry, *back_edges)
             if joined == header:
                 break
             header = joined
-        self._restore_bindings(header)
-        self.visit(node.test)
-        tested_state = self._binding_snapshot()
-        else_state = (
-            self._visit_binding_branch(node.orelse, tested_state)
-            if node.orelse and truth is not True
-            else tested_state
+
+        normal_entry: _BindingSnapshot | None = None
+        if truth is not True:
+            self._restore_bindings(header)
+            self.visit(node.test)
+            normal_entry = self._binding_snapshot()
+        normal_result = (
+            self._visit_binding_branch(node.orelse, normal_entry)
+            if node.orelse and normal_entry is not None
+            else _FlowResult(normal_entry)
         )
-        self._restore_bindings(else_state)
+        break_paths = [snapshot for kind, snapshot in body_result.abrupt if kind == "break"]
+        outer_abrupt = tuple(
+            path for path in body_result.abrupt if path[0] not in {"break", "continue"}
+        )
+        post_paths = [*break_paths]
+        if normal_result.fallthrough is not None:
+            post_paths.append(normal_result.fallthrough)
+        self._apply_flow_result(
+            _FlowResult(
+                self._join_optional_bindings(post_paths),
+                (*outer_abrupt, *normal_result.abrupt),
+            )
+        )
 
     def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
         entry = self._binding_snapshot()
-        body_state, exception_states = self._visit_binding_paths(node.body, entry)
-        normal_state = (
-            self._visit_binding_branch(node.orelse, body_state) if node.orelse else body_state
+        body_result, exception_states = self._visit_binding_paths(node.body, entry)
+        normal_result = (
+            self._visit_binding_branch(node.orelse, body_result.fallthrough)
+            if node.orelse and body_result.fallthrough is not None
+            else _FlowResult(body_result.fallthrough)
         )
-        normal_terminates = self._statements_always_terminate(node.body) or (
-            bool(node.orelse) and self._statements_always_terminate(node.orelse)
-        )
-        completed = [] if normal_terminates else [normal_state]
+        handler_results: list[_FlowResult] = []
         for handler in node.handlers:
             self._restore_bindings(exception_states)
             if handler.type is not None:
@@ -1380,20 +1398,47 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 self._states[-1][handler.name] = _UNKNOWN_VALUE
                 self._functions[-1][handler.name] = frozenset()
                 self._annotations[-1][handler.name] = _UNKNOWN_VALUE
-            handler_state = self._visit_binding_branch(handler.body, self._binding_snapshot())
-            if not self._statements_always_terminate(handler.body):
-                completed.append(handler_state)
-        if node.finalbody:
-            incoming = self._join_binding_snapshots(exception_states, *completed)
-            all_final_state = self._visit_binding_branch(node.finalbody, incoming)
-            final_state = (
-                self._visit_binding_branch(node.finalbody, self._join_binding_snapshots(*completed))
-                if completed
-                else all_final_state
+            handler_results.append(
+                self._visit_binding_branch(handler.body, self._binding_snapshot())
             )
-            self._restore_bindings(final_state)
-        else:
-            self._restore_bindings(self._join_binding_snapshots(*(completed or [entry])))
+
+        fallthrough_paths = [
+            state
+            for state in (
+                normal_result.fallthrough,
+                *(result.fallthrough for result in handler_results),
+            )
+            if state is not None
+        ]
+        abrupt = [
+            *body_result.abrupt,
+            *normal_result.abrupt,
+            *(path for result in handler_results for path in result.abrupt),
+            ("raise", exception_states),
+        ]
+        if not node.finalbody:
+            self._apply_flow_result(
+                _FlowResult(self._join_optional_bindings(fallthrough_paths), tuple(abrupt))
+            )
+            return
+
+        final_fallthrough: _BindingSnapshot | None = None
+        final_abrupt: list[_AbruptPath] = []
+        if fallthrough_paths:
+            completed_final = self._visit_binding_branch(
+                node.finalbody, self._join_binding_snapshots(*fallthrough_paths)
+            )
+            final_fallthrough = completed_final.fallthrough
+            final_abrupt.extend(completed_final.abrupt)
+        for kind in {path_kind for path_kind, _ in abrupt}:
+            incoming = self._join_binding_snapshots(
+                *(snapshot for path_kind, snapshot in abrupt if path_kind == kind)
+            )
+            abrupt_final = self._visit_binding_branch(node.finalbody, incoming)
+            if abrupt_final.fallthrough is not None:
+                final_abrupt.append((kind, abrupt_final.fallthrough))
+            final_abrupt.extend(abrupt_final.abrupt)
+        self._apply_flow_result(_FlowResult(final_fallthrough, tuple(final_abrupt)))
 
     def visit_Try(self, node: ast.Try) -> None:
         self._visit_try(node)
@@ -1525,7 +1570,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         self.visit(node.subject)
         subject = self._expression_value(node.subject)
         initial = self._binding_snapshot()
-        branches: list[_BindingSnapshot] = []
+        branches: list[_FlowResult] = []
         unmatched = True
         for case in node.cases:
             self._restore_bindings(initial)
@@ -1535,9 +1580,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 self.visit(case.guard)
                 if self._static_truth(case.guard) is False:
                     continue
-            branch = self._visit_binding_branch(case.body, self._binding_snapshot())
-            if not self._statements_always_terminate(case.body):
-                branches.append(branch)
+            branches.append(self._visit_binding_branch(case.body, self._binding_snapshot()))
             if (
                 isinstance(case.pattern, ast.MatchAs)
                 and case.pattern.pattern is None
@@ -1546,8 +1589,15 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 unmatched = False
                 break
         if unmatched:
-            branches.append(initial)
-        self._restore_bindings(self._join_binding_snapshots(*(branches or [initial])))
+            branches.append(_FlowResult(initial))
+        self._apply_flow_result(
+            _FlowResult(
+                self._join_optional_bindings(
+                    result.fallthrough for result in branches if result.fallthrough is not None
+                ),
+                tuple(path for result in branches for path in result.abrupt),
+            )
+        )
 
     def _visit_comprehension(
         self,
@@ -1674,8 +1724,9 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             if item.optional_vars is not None:
                 self._visit_store_target(item.optional_vars)
                 self._bind_target_value(item.optional_vars, _UNKNOWN_VALUE)
-        for statement in node.body:
-            self.visit(statement)
+                self._bind_function_target(item.optional_vars, frozenset())
+                self._bind_annotation_target(item.optional_vars, _UNKNOWN_VALUE)
+        self._apply_flow_result(self._visit_binding_branch(node.body, self._binding_snapshot()))
 
     def visit_With(self, node: ast.With) -> None:
         self._visit_with(node)
@@ -1878,11 +1929,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         previous_cache = self._expression_cache
         self._expression_cache = {}
         try:
-            for statement in node.body:
-                terminates = self._statement_always_terminates(statement)
-                self.visit(statement)
-                if terminates:
-                    break
+            self._visit_binding_branch(node.body, self._binding_snapshot())
             return tuple(self._return_values[-1])
         finally:
             self._expression_cache = previous_cache
@@ -1909,11 +1956,28 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         return _join_values(*returned)
 
     def visit_Return(self, node: ast.Return) -> None:
-        if node.value is None:
-            return
-        self.visit(node.value)
-        if self._return_values:
+        if node.value is not None:
+            self.visit(node.value)
+        if node.value is not None and self._return_values:
             self._return_values[-1].append(self._expression_value(node.value))
+        self._flow_abrupts[-1].append(("return", self._binding_snapshot()))
+        self._path_reachable = False
+
+    def visit_Raise(self, node: ast.Raise) -> None:
+        if node.exc is not None:
+            self.visit(node.exc)
+        if node.cause is not None:
+            self.visit(node.cause)
+        self._flow_abrupts[-1].append(("raise", self._binding_snapshot()))
+        self._path_reachable = False
+
+    def visit_Break(self, node: ast.Break) -> None:
+        self._flow_abrupts[-1].append(("break", self._binding_snapshot()))
+        self._path_reachable = False
+
+    def visit_Continue(self, node: ast.Continue) -> None:
+        self._flow_abrupts[-1].append(("continue", self._binding_snapshot()))
+        self._path_reachable = False
 
     def _visit_scoped(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for decorator in node.decorator_list:

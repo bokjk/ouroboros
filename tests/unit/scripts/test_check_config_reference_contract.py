@@ -1299,6 +1299,138 @@ def guaranteed_iteration_shadowing(config):
     )
 
 
+def test_runtime_scan_keeps_for_break_path_separate_from_loop_else(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "for_break_else.py").write_text(
+        """
+def reader(value):
+    return value.min_models
+
+def scan(config, items):
+    handler = external
+    for _ in items:
+        handler = reader
+        break
+    else:
+        handler = external
+    return handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    field = contract.ConfigField("consensus", "min_models")
+
+    assert contract.runtime_reads(tmp_path, frozenset({field})) == frozenset({field})
+
+
+def test_runtime_scan_keeps_while_break_path_separate_from_loop_else(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "while_break_else.py").write_text(
+        """
+def reader(value):
+    return value.threshold
+
+def scan(config, enabled):
+    handler = external
+    while enabled:
+        handler = reader
+        break
+    else:
+        handler = external
+    return handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    field = contract.ConfigField("consensus", "threshold")
+
+    assert contract.runtime_reads(tmp_path, frozenset({field})) == frozenset({field})
+
+
+def test_runtime_scan_runs_finally_with_terminating_try_else_bindings(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "try_else_finally.py").write_text(
+        """
+def reader(value):
+    return value.diversity_required
+
+def scan(config, risky):
+    handler = external
+    try:
+        risky()
+    except LookupError:
+        handler = external
+    else:
+        handler = reader
+        raise RuntimeError
+    finally:
+        handler(config.consensus)
+""",
+        encoding="utf-8",
+    )
+    field = contract.ConfigField("consensus", "diversity_required")
+
+    assert contract.runtime_reads(tmp_path, frozenset({field})) == frozenset({field})
+
+
+def test_runtime_scan_distinguishes_loop_control_and_nested_break_paths(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "loop_control_neighbors.py").write_text(
+        """
+def nested_reader(value):
+    return value.satisfaction_threshold
+
+def unreachable_reader(value):
+    return value.uncertainty_threshold
+
+def nested_break(config, outer_items, inner_items):
+    handler = external
+    for _ in outer_items:
+        for _ in inner_items:
+            handler = nested_reader
+            break
+        else:
+            handler = external
+        break
+    else:
+        handler = external
+    handler(config.evaluation)
+
+def continue_exhausts_into_else(config, items):
+    handler = external
+    for _ in items:
+        handler = unreachable_reader
+        continue
+    else:
+        handler = external
+    handler(config.evaluation)
+
+def return_and_raise_do_not_reach_after_loop(config, items, enabled):
+    handler = external
+    for _ in items:
+        handler = unreachable_reader
+        return None
+    else:
+        handler = external
+    handler(config.evaluation)
+
+    while enabled:
+        handler = unreachable_reader
+        raise RuntimeError
+    else:
+        handler = external
+    handler(config.evaluation)
+""",
+        encoding="utf-8",
+    )
+    nested = contract.ConfigField("evaluation", "satisfaction_threshold")
+    unreachable = contract.ConfigField("evaluation", "uncertainty_threshold")
+
+    assert contract.runtime_reads(tmp_path, frozenset({nested, unreachable})) == frozenset({nested})
+
+
 def test_runtime_scan_stops_after_unconditional_exit_but_keeps_dynamic_fallthrough(
     contract, tmp_path: Path
 ) -> None:
