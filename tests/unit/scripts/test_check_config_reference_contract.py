@@ -329,6 +329,223 @@ def match_paths(config, report, selector):
     )
 
 
+def test_runtime_scan_preserves_mapping_class_and_rest_pattern_provenance(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "structural_patterns.py").write_text(
+        """
+def mapping_pattern(config, report):
+    match {"section": config.evaluation}:
+        case {"section": direct_section}:
+            direct_mapping_read = direct_section.stage1_enabled
+
+    mapping_source = {"section": config.evaluation}
+    match {**mapping_source}:
+        case {"section": expanded_section}:
+            expanded_mapping_read = expanded_section.assertion_extraction_model
+
+    payload = {
+        "section": config.evaluation,
+        "remaining": config.consensus,
+        "unrelated": report.evaluation,
+    }
+    match payload:
+        case {"section": section, "unrelated": unrelated, **rest}:
+            mapping_read = section.stage2_enabled
+            rest_read = rest["remaining"].models
+            unrelated_read = unrelated.satisfaction_threshold
+
+class Envelope:
+    __match_args__ = ("positional",)
+
+def class_pattern(config, report):
+    match Envelope(section=config.evaluation):
+        case Envelope(section=direct_section):
+            direct_keyword_read = direct_section.stage3_enabled
+
+    keyword_source = {"section": config.consensus}
+    match Envelope(**keyword_source):
+        case Envelope(section=expanded_section):
+            expanded_keyword_read = expanded_section.judge_model
+
+    payload = Envelope(
+        config.consensus,
+        section=config.evaluation,
+        unrelated=report.consensus,
+    )
+    match payload:
+        case Envelope(positional, section=section, unrelated=unrelated):
+            positional_read = positional.devil_model
+            keyword_read = section.uncertainty_threshold
+            unrelated_read = unrelated.threshold
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+
+def test_runtime_scan_tracks_indirect_loop_containers_and_sequence_star_patterns(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "indirect_containers.py").write_text(
+        """
+def indirect_loop(config, report):
+    sections = [config.evaluation]
+    aliases = sections
+    for section in aliases:
+        loop_read = section.stage1_enabled
+
+    pairs = [(config.evaluation, report.evaluation)]
+    for section, unrelated in pairs:
+        destructured_loop_read = section.stage2_enabled
+        unrelated_read = unrelated.satisfaction_threshold
+
+    match [config.consensus, report.consensus]:
+        case [consensus, *rest]:
+            head_read = consensus.models
+            unrelated_star_read = rest[0].threshold
+
+async def indirect_async_loop(config):
+    sections = [config.consensus]
+    async for section in sections:
+        async_loop_read = section.devil_model
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+
+def test_runtime_scan_comprehension_targets_shadow_outer_aliases_in_evaluation_order(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "comprehensions.py").write_text(
+        """
+def comprehension_shadowing(config, reports):
+    section = config.evaluation
+    ignored_list = [section.stage1_enabled for section in reports]
+    ignored_set = {section.stage2_enabled for section in reports}
+    ignored_dict = {section.stage3_enabled: section for section in reports}
+    ignored_generator = (section.satisfaction_threshold for section in reports)
+    outer_read = section.semantic_model
+
+    sections = [config.evaluation]
+    positive_list = [item.uncertainty_threshold for item in sections]
+    nested = [
+        item.assertion_extraction_model
+        for group in [[config.evaluation]]
+        for item in group
+    ]
+
+async def async_comprehension_shadowing(config, reports):
+    section = config.consensus
+    ignored = [section.threshold async for section in reports]
+    outer_read = section.models
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+
+def test_runtime_scan_import_and_context_manager_bindings_override_config_inference(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "binding_overrides.py").write_text(
+        """
+def imported_names():
+    import report as config
+    from report import settings
+    imported_config = config.evaluation.stage1_enabled
+    imported_settings = settings.consensus.models
+
+def context_names(manager):
+    with manager as config:
+        context_config = config.evaluation.stage2_enabled
+    after_context = config.evaluation.stage3_enabled
+
+async def async_context_names(manager):
+    async with manager as settings:
+        context_settings = settings.consensus.threshold
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("consensus", "models"),
+            contract.ConfigField("consensus", "threshold"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset()
+
+
 def test_every_schema_field_needs_exactly_one_disposition(contract) -> None:
     active = contract.ConfigField("evaluation", "active")
     inert = contract.ConfigField("evaluation", "inert")
