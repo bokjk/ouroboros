@@ -1478,7 +1478,7 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             relations = {
                 name: cls._known_exception_subclass(raised, name)
                 for name in names
-                if name not in path.exception_exclusions
+                if not cls._exception_domain_excluded(name, path.exception_exclusions)
             }
             if any(relation is True for relation in relations.values()):
                 return (path,), ()

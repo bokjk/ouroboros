@@ -1691,6 +1691,18 @@ def broader_handler_shadows_later_subclass(config):
         handler = unreachable_reader
     handler(config.consensus)
 
+def broader_handler_subtracts_unknown_exact_domain(config, error_type):
+    handler = external
+    try:
+        raise error_type
+    except Exception:
+        handler = exception_reader
+    except ValueError:
+        handler = unreachable_reader
+    except:
+        handler = outer_reader
+    handler(config.consensus)
+
 def tuple_uses_static_subclass_match(config):
     handler = external
     try:
