@@ -248,6 +248,71 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             return None
         return dict(pairs).get(name)
 
+    def _replace_name_value(self, name: str, value: _AbstractValue) -> None:
+        for scope in reversed(self._states):
+            if name in scope:
+                scope[name] = value
+                return
+        self._states[-1][name] = value
+
+    @staticmethod
+    def _mapping_values(value: _AbstractValue) -> tuple[_AbstractValue, ...]:
+        return tuple(item for _, item in value.entries or ())
+
+    def _dict_method_value(self, node: ast.Call) -> _AbstractValue | None:
+        if not isinstance(node.func, ast.Attribute):
+            return None
+        method = node.func.attr
+        if method not in {"copy", "get", "items", "keys", "setdefault", "values"}:
+            return None
+        owner = self._expression_value(node.func.value)
+        values = self._mapping_values(owner)
+        if method == "copy":
+            return owner
+        if method == "values":
+            return _AbstractValue(items=values) if owner.entries is not None else _UNKNOWN_VALUE
+        if method == "items":
+            if owner.entries is None:
+                return _UNKNOWN_VALUE
+            return _AbstractValue(
+                items=tuple(_AbstractValue(items=(_UNKNOWN_VALUE, value)) for value in values)
+            )
+        if method == "keys":
+            return (
+                _AbstractValue(items=tuple(_UNKNOWN_VALUE for _ in owner.entries))
+                if owner.entries is not None
+                else _UNKNOWN_VALUE
+            )
+
+        default = self._expression_value(node.args[1]) if len(node.args) >= 2 else _UNKNOWN_VALUE
+        if not node.args:
+            return default
+        key = node.args[0]
+        if not isinstance(key, ast.Constant):
+            return _join_values(*values, default)
+        token = _key_token(key)
+        selected = self._named_value(owner.entries, token)
+        if method == "get":
+            return selected if selected is not None else default
+
+        # ``setdefault`` returns the existing value or inserts and returns the
+        # default. Mutate a direct name receiver so a later read sees the
+        # inserted abstract value; aliases remain deliberately bounded.
+        if selected is not None:
+            return selected
+        if owner.entries is not None and isinstance(node.func.value, ast.Name):
+            entries = (*owner.entries, (token, default))
+            self._replace_name_value(
+                node.func.value.id,
+                _AbstractValue(
+                    origins=owner.origins,
+                    items=owner.items,
+                    entries=entries,
+                    attributes=owner.attributes,
+                ),
+            )
+        return default
+
     def _expression_value(self, node: ast.AST) -> _AbstractValue:
         cached = self._expression_cache.get(id(node))
         if cached is not None:
@@ -269,6 +334,9 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                 return _origin_value(_CONFIG_ROOT)
             return _UNKNOWN_VALUE
         if isinstance(node, ast.Call):
+            dict_method_value = self._dict_method_value(node)
+            if dict_method_value is not None:
+                return dict_method_value
             callable_name = _callable_name(node.func)
             if callable_name is not None and _CONFIG_FACTORY.search(callable_name):
                 if isinstance(node.func, ast.Name):
@@ -311,6 +379,16 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
                     items=tuple(items),
                     attributes=tuple(attributes),
                 )
+            if isinstance(node.func, ast.Name) and node.func.id == "dict":
+                entries: list[tuple[str, _AbstractValue]] = []
+                if node.args:
+                    entries.extend(self._expression_value(node.args[0]).entries or ())
+                entries.extend(
+                    (_key_token(ast.Constant(keyword.arg)), self._expression_value(keyword.value))
+                    for keyword in node.keywords
+                    if keyword.arg is not None
+                )
+                return _AbstractValue(entries=tuple(entries))
             return _UNKNOWN_VALUE
         if isinstance(node, ast.Subscript):
             owner = self._expression_value(node.value)
@@ -355,6 +433,12 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
             )
         if isinstance(node, ast.BoolOp):
             return _join_values(*(self._expression_value(value) for value in node.values))
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            left = self._expression_value(node.left)
+            right = self._expression_value(node.right)
+            entries = dict(left.entries or ())
+            entries.update(right.entries or ())
+            return _AbstractValue(entries=tuple(sorted(entries.items())))
         if isinstance(node, ast.NamedExpr):
             return self._expression_value(node.value)
         return _UNKNOWN_VALUE
@@ -371,6 +455,9 @@ class _RuntimeReadVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        # Evaluate once even when the call is a standalone mutating
+        # ``setdefault`` expression.
+        self._expression_value(node)
         if (
             isinstance(node.func, ast.Name)
             and node.func.id == "getattr"

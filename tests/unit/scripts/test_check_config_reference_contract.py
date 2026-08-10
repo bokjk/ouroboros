@@ -459,6 +459,90 @@ async def indirect_async_loop(config):
     )
 
 
+def test_runtime_scan_models_standard_dict_consumers_key_sensitively(
+    contract, tmp_path: Path
+) -> None:
+    (tmp_path / "dict_consumers.py").write_text(
+        """
+def dict_consumers(config, report, dynamic_key):
+    sections = {
+        "primary": config.evaluation,
+        "unrelated": report.evaluation,
+    }
+    for section in sections.values():
+        values_read = section.stage1_enabled
+    for _, section in sections.items():
+        items_read = section.stage2_enabled
+
+    primary_read = sections.get("primary").stage3_enabled
+    primary_with_default = sections.get(
+        "primary", report.evaluation
+    ).uncertainty_threshold
+    dynamic_read = sections.get(dynamic_key, report.evaluation).assertion_extraction_model
+    missing_read = sections.get("missing").satisfaction_threshold
+    missing_default = sections.get("missing", config.consensus).models
+
+    for key in sections.keys():
+        non_config_key_read = key.satisfaction_threshold
+
+    reports = {"primary": report.evaluation}
+    report_get = reports.get("primary").satisfaction_threshold
+    report_dynamic = reports.get(dynamic_key, report.evaluation).satisfaction_threshold
+    for report_section in reports.values():
+        report_value_read = report_section.satisfaction_threshold
+
+    literals = {"primary": "not config"}
+    literal_read = literals.get("primary").satisfaction_threshold
+
+    copied = sections.copy()
+    copied_read = copied.get("primary").semantic_model
+    constructed = dict(sections)
+    constructed_read = constructed["primary"].stage1_enabled
+
+    unioned = reports | {"primary": config.consensus}
+    union_read = unioned.get("primary").devil_model
+    overridden = sections | {
+        "primary": report.evaluation,
+        "unrelated": report.evaluation,
+    }
+    overridden_read = overridden.get("primary").satisfaction_threshold
+
+    defaults = {}
+    defaults.setdefault("primary", config.consensus)
+    inserted_read = defaults.get("primary").judge_model
+""",
+        encoding="utf-8",
+    )
+    fields = frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "satisfaction_threshold"),
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+    assert contract.runtime_reads(tmp_path, fields) == frozenset(
+        {
+            contract.ConfigField("evaluation", "assertion_extraction_model"),
+            contract.ConfigField("evaluation", "semantic_model"),
+            contract.ConfigField("evaluation", "stage1_enabled"),
+            contract.ConfigField("evaluation", "stage2_enabled"),
+            contract.ConfigField("evaluation", "stage3_enabled"),
+            contract.ConfigField("evaluation", "uncertainty_threshold"),
+            contract.ConfigField("consensus", "devil_model"),
+            contract.ConfigField("consensus", "judge_model"),
+            contract.ConfigField("consensus", "models"),
+        }
+    )
+
+
 def test_runtime_scan_comprehension_targets_shadow_outer_aliases_in_evaluation_order(
     contract, tmp_path: Path
 ) -> None:
